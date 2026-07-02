@@ -74,8 +74,20 @@ def test_detect_block_deep_compact_team_reads_low():
 
 
 def test_detect_matchups_isolated_2v2_fires():
+    # M6: detect_matchups now groups players via ALIVE relational edges
+    # (bto.patterns.edges.track_edges) rather than raw per-frame proximity
+    # clustering. An edge needs >= 1.2s of sustained evidence before it goes
+    # alive (edges.MARK_SUSTAIN_S) -- the pre-M6 fixture (30 frames @ 25Hz =
+    # 1.16s) never cleared that bar at all, so it is extended here (75
+    # frames = 3.0s) to give the edges room to mature plus the detector's
+    # own min_duration_s=1.0s on top. Precise 1:1 nearest-sustained marking
+    # also means this loose "everyone within radius" scene now reads as two
+    # honest 1v1 duels (H1-A1, H2-A2) rather than one crude merged 2v2 blob
+    # -- a more tactically accurate grouping, and the actual point of the
+    # relational rework. What the test still asserts: the wing duel(s) FIRE
+    # (unlike a far-off, ball-less cluster) and together cover both pairs.
     frames = []
-    for k in range(30):
+    for k in range(75):
         t = k * DT
         players = [
             PlayerPos("H1", HOME, 90.0, 8.0),
@@ -87,9 +99,11 @@ def test_detect_matchups_isolated_2v2_fires():
         frames.append(make_frame(t, players, (91.0, 10.0), {HOME: 1, AWAY: -1}))
 
     dets = matchups_mod.detect_matchups(frames, radius=8.0, n_max=3, min_duration_s=1.0)
-    two_v_two = [d for d in dets if d.type == "2v2" and set(d.players) == {"H1", "H2", "A1", "A2"}]
-    assert two_v_two, [(d.type, d.players) for d in dets]
-    assert two_v_two[0].t_end - two_v_two[0].t_start >= 1.0 - 1e-9
+    wing = [d for d in dets if set(d.players) & {"H1", "H2", "A1", "A2"}]
+    assert wing, [(d.type, d.players) for d in dets]
+    assert {p for d in wing for p in d.players} == {"H1", "H2", "A1", "A2"}
+    assert wing[0].t_end - wing[0].t_start >= 1.0 - 1e-9
+    assert all("track" in d.geometry for d in wing)
 
 
 def test_detect_isolations_1v1_fires_only_when_region_empty():

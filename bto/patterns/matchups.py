@@ -1,17 +1,30 @@
-"""NvN local matchups + 1v1 isolation detection (SPEC S6).
+"""NvN local matchups + 1v1 isolation detection (SPEC S6; M6 relational rework).
 
-Pure geometry on the coordinate stream; detect_isolations additionally uses
-possession() to know who the ball carrier is.
+detect_matchups now reads its candidate structure off the relational layer
+(bto.patterns.edges): a matchup is a connected component of currently-ALIVE
+marking/press edges near the ball, instead of raw per-frame proximity. This
+is the fix for "dancing rectangles" -- an edge only exists once a defender
+has spent >= edges.BIRTH_S (1.2s) sustained on the same attacker/carrier, so
+a matchup can no longer flicker into existence off a single close-but-brief
+frame; its minimum lifetime is now bounded from below by edge maturity, not
+just this module's own min_duration_s. detect_isolations keeps its original
+possession-based per-frame logic (it already had strong temporal hysteresis)
+and only gains a moving 'track' sample for the renderer.
 
 geometry keys:
   detect_matchups:   pairs=[(xa, ya, xd, yd), ...] closest cross-team links
                       (first-team coords first: the attacking team when
                       possession() covers the frame, else HOME);
                       region=(min_x, min_y, max_x, max_y) bounding box of
-                      every player involved.
-  detect_isolations: attacker=(x, y), defender=(x, y).
+                      every player involved;
+                      track=[(t, xa, ya, xb, yb), ...] the underlying edges'
+                      samples over the component's lifetime, merged and time-
+                      sorted -- the moving-geometry render convention.
+  detect_isolations: attacker=(x, y), defender=(x, y) (last-frame snapshot,
+                      unchanged); track=[(t, xa, ya, xd, yd), ...] sampled at
+                      ~5 Hz over the duel's span.
 
-Precision gates (M3 precision pass):
+Precision gates (M3 precision pass, unchanged):
   detect_matchups: confidence is scaled by ball proximity (a duel far from
       the live ball is not a duel -- audited FPs were 9-40m off the ball),
       detections whose lifetime-min ball distance exceeds ball_hard_gate_m
@@ -31,7 +44,10 @@ Precision gates (M3 precision pass):
 from math import hypot
 
 from bto.core import AWAY, Detection, Frame, HOME, other
+from bto.patterns.edges import Edge, track_edges
 from bto.patterns.possession import Spell, possession
+
+_TRACK_SAMPLE_DT = 0.2  # ~5 Hz, matches edges.SAMPLE_DT
 
 
 def _attacking_team(spells: list[Spell], frame_idx: int) -> str | None:
@@ -40,43 +56,6 @@ def _attacking_team(spells: list[Spell], frame_idx: int) -> str | None:
         if s.i_start <= frame_idx <= s.i_end:
             return s.team
     return None
-
-
-def _components(home, away, radius):
-    """Bipartite proximity connected components.
-
-    home, away: list[PlayerPos]. Edges only between opposite teams (distance
-    < radius); components are then read off via union-find. Returns
-    [(home_subset, away_subset), ...] for components that contain at least
-    one player from each team (pure single-team clusters are not matchups).
-    """
-    nodes = [("h", p) for p in home] + [("a", p) for p in away]
-    n = len(nodes)
-    parent = list(range(n))
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def union(i, j):
-        ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[ri] = rj
-
-    for i in range(len(home)):
-        pi = home[i]
-        for j in range(len(home), n):
-            pj = nodes[j][1]
-            if hypot(pi.x - pj.x, pi.y - pj.y) < radius:
-                union(i, j)
-
-    groups: dict[int, tuple[list, list]] = {}
-    for i, (side, p) in enumerate(nodes):
-        h_list, a_list = groups.setdefault(find(i), ([], []))
-        (h_list if side == "h" else a_list).append(p)
-    return [(h, a) for h, a in groups.values() if h and a]
 
 
 def _pairs_geometry(first, second):
@@ -111,20 +90,57 @@ def _matchup_confidence(first, second, radius):
     return max(0.0, min(1.0, 1.0 - avg / radius))
 
 
-def _candidates(frame: Frame, radius: float, n_max: int, attacking_team):
-    home = frame.team_players(HOME)
-    away = frame.team_players(AWAY)
+def _alive_components(alive_edges: list[Edge], pos_by_id: dict, n_max: int):
+    """Connected components of currently-alive edges, split by team.
+
+    Union-find over track_ids linked by an alive marking/press edge (both
+    kinds count -- both are a defender-attacker relational link); only
+    components with players from both teams and within the NvN size cap are
+    returned, each tagged with the alive edges that connect its members (for
+    the moving 'track' geometry).
+    """
+    ids = sorted({e.a for e in alive_edges} | {e.b for e in alive_edges})
+    ids = [tid for tid in ids if tid in pos_by_id]
+    if not ids:
+        return []
+    idx = {tid: k for k, tid in enumerate(ids)}
+    parent = list(range(len(ids)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    comp_edges: dict[int, list[Edge]] = {}
+    for e in alive_edges:
+        if e.a in idx and e.b in idx:
+            union(idx[e.a], idx[e.b])
+
+    for e in alive_edges:
+        if e.a in idx and e.b in idx:
+            comp_edges.setdefault(find(idx[e.a]), []).append(e)
+
+    groups: dict[int, list[str]] = {}
+    for tid in ids:
+        groups.setdefault(find(idx[tid]), []).append(tid)
+
     out = []
-    for h_list, a_list in _components(home, away, radius):
+    for root, members in groups.items():
+        h_list = [pos_by_id[t] for t in members if pos_by_id[t].team == HOME]
+        a_list = [pos_by_id[t] for t in members if pos_by_id[t].team == AWAY]
+        if not h_list or not a_list:
+            continue
         n, m = len(h_list), len(a_list)
         if max(n, m) > n_max or abs(n - m) > 1:
             continue
-        if attacking_team == AWAY:
-            first, second, type_ = a_list, h_list, f"{m}v{n}"
-        else:
-            first, second, type_ = h_list, a_list, f"{n}v{m}"
         players = frozenset(p.track_id for p in h_list + a_list)
-        out.append((players, type_, first, second))
+        out.append((players, h_list, a_list, comp_edges.get(root, [])))
     return out
 
 
@@ -138,33 +154,38 @@ def detect_matchups(
     min_confidence: float = 0.1,
     max_active_s: float = 3.0,
     reopen_cooldown_s: float = 4.0,
+    edges: list[Edge] | None = None,
 ) -> list[Detection]:
-    """NvN local matchups: bipartite proximity connected components.
+    """NvN local matchups: connected components of ALIVE relational edges.
 
     A component with n home / m away players (max(n, m) <= n_max, sizes
-    differing by at most 1) is a candidate matchup for that frame. Runs of
-    consecutive frames sharing the exact same player set and type are merged
-    into one Detection.
+    differing by at most 1), all linked via currently-alive marking/press
+    edges (bto.patterns.edges.track_edges), is a candidate matchup for that
+    frame. Runs of consecutive frames sharing the exact same player set and
+    type are merged into one Detection; because an edge itself needs >= 1.2s
+    of sustained evidence before it goes alive, a matchup's minimum lifetime
+    is now naturally bounded below by edge maturity -- min_duration_s is a
+    second, independent floor on top of that, not the only one.
 
-    Precision gates:
+    edges: precomputed track_edges(frames) output; computed internally when
+    None (callers running several M6 detectors together, e.g. run_all,
+    should compute edges once and pass it to each to avoid recomputation).
+
+    Precision gates (unchanged from the proximity-based version):
     - per-frame confidence = spacing confidence * ball_factor, where
       ball_factor = clip(1 - d_ball / ball_soft_m, 0.05, 1.0) and d_ball is
       the distance from the live ball to the component's nearest player
-      (0.3 neutral when the ball is unseen). Two markers jogging together
-      30m off the ball score ~0 and die at the min_confidence floor.
+      (0.3 neutral when the ball is unseen).
     - detections observed together with the ball but NEVER within
-      ball_hard_gate_m of it over their whole life are dropped outright
-      (a matchup whose ball is unseen for its entire life is only soft-gated
-      via the neutral factor -- clean data has dead-ball gaps too).
+      ball_hard_gate_m of it over their whole life are dropped outright.
     - matchups shorter than min_duration_s, or whose PEAK per-frame
-      confidence never reaches min_confidence (i.e. at no moment did they
-      look like a tight duel near the ball), are dropped. The reported
-      confidence stays the mean, so a duel that drifted off the ball carries
-      a low viewer-facing score even though it survived the gate.
+      confidence never reaches min_confidence, are dropped.
     - an active matchup is force-closed once it has lived max_active_s and
-      the same player set may not reopen for reopen_cooldown_s (bounds how
-      stale the single rendered geometry snapshot can get).
+      the same player set may not reopen for reopen_cooldown_s.
     """
+    if edges is None:
+        edges = track_edges(frames)
+
     spells = possession(frames)
     active: dict[frozenset, dict] = {}
     cooldown_until: dict[frozenset, float] = {}
@@ -179,11 +200,17 @@ def detect_matchups(
             and max(confidences) >= min_confidence
             and (st["min_d_ball"] is None or st["min_d_ball"] <= ball_hard_gate_m)
         ):
+            track = sorted(
+                {s for e in st["edges"].values() for s in e.samples},
+                key=lambda s: s[0],
+            )
+            geometry = dict(st["geometry"])
+            geometry["track"] = track
             detections.append(
                 Detection(
                     type=st["type"],
                     players=sorted(key),
-                    geometry=st["geometry"],
+                    geometry=geometry,
                     confidence=mean_conf,
                     t_start=st["t_start"],
                     t_end=st["t_end"],
@@ -192,15 +219,21 @@ def detect_matchups(
 
     for i, frame in enumerate(frames):
         attacker = _attacking_team(spells, i)
+        pos_by_id = {p.track_id: p for p in frame.players}
+        alive_edges = [e for e in edges if e.i_start <= i <= e.i_end]
         seen_keys = set()
         ball = frame.ball
-        for key, type_, first, second in _candidates(frame, radius, n_max, attacker):
+        for key, h_list, a_list, comp_edges in _alive_components(alive_edges, pos_by_id, n_max):
+            n, m = len(h_list), len(a_list)
+            if attacker == AWAY:
+                first, second, type_ = a_list, h_list, f"{m}v{n}"
+            else:
+                first, second, type_ = h_list, a_list, f"{n}v{m}"
+
             if frame.t < cooldown_until.get(key, float("-inf")):
                 continue  # recently force-closed: let it reopen fresh later
             if ball is not None:
-                d_ball = min(
-                    hypot(p.x - ball[0], p.y - ball[1]) for p in first + second
-                )
+                d_ball = min(hypot(p.x - ball[0], p.y - ball[1]) for p in first + second)
                 ball_factor = max(0.05, min(1.0, 1.0 - d_ball / ball_soft_m))
             else:
                 d_ball = None  # unseen ball: no evidence either way
@@ -221,11 +254,11 @@ def detect_matchups(
                 st["t_end"] = frame.t
                 st["geometry"] = geometry
                 st["confidences"].append(confidence)
+                for e in comp_edges:
+                    st["edges"][id(e)] = e
                 if d_ball is not None:
                     st["min_d_ball"] = (
-                        d_ball
-                        if st["min_d_ball"] is None
-                        else min(st["min_d_ball"], d_ball)
+                        d_ball if st["min_d_ball"] is None else min(st["min_d_ball"], d_ball)
                     )
             else:
                 if st is not None:
@@ -238,6 +271,7 @@ def detect_matchups(
                     "geometry": geometry,
                     "confidences": [confidence],
                     "min_d_ball": d_ball,
+                    "edges": {id(e): e for e in comp_edges},
                 }
         for key in list(active):
             if key not in seen_keys:
@@ -274,6 +308,10 @@ def detect_isolations(
     emission when the gap is under merge_gap_s, else dropped -- one sustained
     duel, one chip, and a pair that keeps flickering in and out (tracker
     noise) can't re-chip every few seconds.
+
+    geometry also carries 'track': [(t, x_attacker, y_attacker, x_defender,
+    y_defender), ...] sampled at ~5 Hz over the duel's span (moving-geometry
+    render convention).
     """
     spells = possession(frames)
     active: dict | None = None
@@ -298,10 +336,12 @@ def detect_isolations(
             span = max(old.t_end - old.t_start, 1e-9) + max(
                 active["t_end"] - active["t_start"], 1e-9
             )
+            geometry = dict(active["geometry"])
+            geometry["track"] = (old.geometry.get("track") or []) + active["track"]
             detections[prev_i] = Detection(
                 type="isolation",
                 players=old.players,
-                geometry=active["geometry"],
+                geometry=geometry,
                 confidence=merged_conf / span,
                 t_start=old.t_start,
                 t_end=active["t_end"],
@@ -313,11 +353,13 @@ def detect_isolations(
             # backward across the dropped gap into a long-dead chip.
             last_seen[pair_key] = [active["t_end"], None]
         elif active["t_end"] - active["t_start"] >= min_duration_s:
+            geometry = dict(active["geometry"])
+            geometry["track"] = active["track"]
             detections.append(
                 Detection(
                     type="isolation",
                     players=[active["attacker"], active["defender"]],
-                    geometry=active["geometry"],
+                    geometry=geometry,
                     confidence=sum(confidences) / len(confidences),
                     t_start=active["t_start"],
                     t_end=active["t_end"],
@@ -394,11 +436,17 @@ def detect_isolations(
                     "t_end": frame.t,
                     "geometry": geometry,
                     "confidences": [confidence],
+                    "track": [(frame.t, *geometry["attacker"], *geometry["defender"])],
                 }
             else:
                 active["t_end"] = frame.t
                 active["geometry"] = geometry
                 active["confidences"].append(confidence)
+                last_t = active["track"][-1][0] if active["track"] else -1e18
+                if frame.t - last_t >= _TRACK_SAMPLE_DT:
+                    active["track"].append(
+                        (frame.t, *geometry["attacker"], *geometry["defender"])
+                    )
     if active is not None:
         close()
     detections.sort(key=lambda d: d.t_start)
@@ -410,14 +458,20 @@ if __name__ == "__main__":
 
     # Synthetic self-check: a clean 1v1 isolation on the left while the ball
     # starts there, then the ball moves to a tight 2v2 duel on the right wing
-    # (present the whole time, but it must only fire as a matchup WHILE the
-    # ball is there -- the ball-proximity gate).
+    # (present the whole clip, but it must only fire as a matchup once its
+    # underlying marking/press edges have matured AND while the ball is
+    # there -- both the edge-lifecycle gate and the pre-existing ball-
+    # proximity gate). Extended from the pre-M6 fixture (55 frames / 2.2s)
+    # to 150 frames / 6.0s: edges need >=1.2s sustained evidence to go alive
+    # before a matchup can even be considered, so the fixture needs enough
+    # runway for that plus this module's own min_duration_s.
     frames = []
-    for k in range(55):
+    n = 150
+    for k in range(n):
         t = k * 0.04  # 25 Hz
-        ball_at_h3 = k < 25
+        ball_at_h3 = k < 50  # 2.0s
         players = [
-            # --- wing 2v2 (around x=90, y=10), stays tight all 55 frames ---
+            # --- wing 2v2 (around x=90, y=10), stays tight the whole clip ---
             PlayerPos("H1", HOME, 90.0, 8.0),
             PlayerPos("H2", HOME, 92.0, 12.0),
             PlayerPos("A1", AWAY, 91.0, 9.0),
@@ -431,28 +485,58 @@ if __name__ == "__main__":
             PlayerPos("H5", HOME, 54.0, 35.0),  # within iso_radius of carrier
             PlayerPos("A5", AWAY, 48.0, 33.0),
         ]
-        # frames 0-24: ball with H3, isolated on the far side of the pitch.
-        # frames 25-54: ball moves to the wing 2v2.
-        ball = (10.0, 60.0) if ball_at_h3 else (91.0, 10.0)
+        # ball with H3 first (isolated, far side of the pitch), then with the
+        # wing 2v2 -- but held short of A1's control radius so HOME stays on
+        # the ball throughout (a genuine turnover is a separate concern).
+        ball = (10.0, 60.0) if ball_at_h3 else (89.5, 8.3)
         frames.append(
             Frame(t=t, players=players, ball=ball, attacking={HOME: 1, AWAY: -1})
         )
 
-    matchups = detect_matchups(frames, radius=8.0, n_max=3, min_duration_s=1.0)
-    wing_2v2 = [d for d in matchups if d.type in ("2v2",) and "H1" in d.players]
-    assert wing_2v2, f"expected a 2v2 on the wing, got {[d.type for d in matchups]}"
-    d = wing_2v2[0]
-    assert set(d.players) == {"H1", "H2", "A1", "A2"}
+    edges = track_edges(frames)
+    matchups = detect_matchups(frames, radius=8.0, n_max=3, min_duration_s=1.0, edges=edges)
+    wing = [d for d in matchups if set(d.players) & {"H1", "H2", "A1", "A2"}]
+    # The relational edges layer does precise 1:1 nearest-sustained marking
+    # (not crude "everyone within radius" clustering), so this wing scenario
+    # now naturally reads as two separate 1v1 duels (H1-A1, H2-A2) rather
+    # than one merged 2v2 blob -- a more tactically honest grouping. What
+    # matters for the "still fires through the new path" contract is that
+    # every wing player is covered by SOME matchup.
+    assert wing, f"expected the wing duel(s) to fire, got {[(d.type, d.players) for d in matchups]}"
+    covered = {p for d in wing for p in d.players}
+    assert covered == {"H1", "H2", "A1", "A2"}, covered
+    d = wing[0]
     assert d.t_end - d.t_start >= 1.0 - 1e-9
-    assert "pairs" in d.geometry and "region" in d.geometry
-    assert len(d.geometry["pairs"]) >= 2
+    assert "pairs" in d.geometry and "region" in d.geometry and "track" in d.geometry
+    assert len(d.geometry["pairs"]) >= 1
+    assert all(len(w.geometry["track"]) >= 2 for w in wing)
+    assert len(d.geometry["track"]) >= 2, d.geometry["track"]
 
     # The crowded midfield H4-A4-H5-A5 is also a tight 2v2 component, but the
-    # ball NEVER comes near it -- the ball hard gate must suppress it (this
-    # was the audited FP mode: cross-team clusters 9-40m off the ball).
+    # ball NEVER comes near it -- the ball hard gate must suppress it.
     assert not any("H4" in d.players for d in matchups), (
         f"off-ball midfield 2v2 must be suppressed, got {[(d.type, d.players) for d in matchups]}"
     )
+
+    # THE WIN: a 0.3s proximity blip that would have fired a matchup under
+    # the old raw-proximity detector (min_duration_s only, no edge maturity
+    # requirement) must NOT fire now, even with a permissive min_duration_s
+    # -- the edge itself never matures within 0.3s, so there is no alive
+    # edge, so there is no component, regardless of this module's own gate.
+    blip_frames = []
+    for k in range(40):  # 1.6s
+        t = k * 0.04
+        close_now = 10 <= k <= 17  # ~0.28s window: a brief cross, not a duel
+        players = [
+            PlayerPos("B1", HOME, 50.0, 30.0 if not close_now else 34.2),
+            PlayerPos("C1", AWAY, 50.5, 34.0),
+            PlayerPos("B2", HOME, 20.0, 20.0),  # keeps possession on HOME, far away
+        ]
+        blip_frames.append(
+            Frame(t=t, players=players, ball=(20.0, 20.0), attacking={HOME: 1, AWAY: -1})
+        )
+    blip_matchups = detect_matchups(blip_frames, radius=8.0, n_max=3, min_duration_s=0.05)
+    assert not blip_matchups, f"0.3s proximity blip must not fire a matchup, got {blip_matchups}"
 
     isolations = detect_isolations(frames, iso_radius=10.0, engage_dist=5.0)
     iso_players = [set(d.players) for d in isolations]
@@ -467,5 +551,12 @@ if __name__ == "__main__":
         10.0,
         60.0,
     )
+    assert "track" in iso.geometry and len(iso.geometry["track"]) >= 2
 
-    print("OK", [d.type for d in matchups], [d.players for d in isolations])
+    print(
+        "OK",
+        [d.type for d in matchups],
+        [d.players for d in isolations],
+        "blip suppressed:",
+        not blip_matchups,
+    )

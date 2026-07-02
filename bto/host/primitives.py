@@ -63,22 +63,36 @@ from bto.render.overlay import (
     COLOR_HOME,
     COLOR_AWAY,
     COLOR_ISO,
+    COLOR_MARKING,
     COLOR_NVN,
     COLOR_OFFSIDE,
+    COLOR_PRESS_ENGAGE,
     COLOR_RUN,
     COLOR_TRIANGLE,
+    EDGE_CHIP_TOP_N,
+    EDGE_TYPES,
     FADE_S,
+    MAX_EDGES,
     MAX_EVENTS,
     MIN_EVENT_CONF,
     MIN_EVENT_DUR_EXEMPT,
     MIN_EVENT_DUR_S,
+    MOVING_PLAY_STYLE,
+    MOVING_PLAY_TYPES,
     PRESS_COLORS,
     circle_m,
+    interp_track,
+    paths_in,
+    path_prefix,
     project,
     sample_polyline_m,
+    select_edges,
+    tracks_in,
 )
 
-EVENT_TYPES = {"back_pass", "triangle", "isolation", "press", "overlap", "underlap"}
+EVENT_TYPES = {
+    "back_pass", "triangle", "isolation", "press", "overlap", "underlap",
+} | MOVING_PLAY_TYPES
 
 
 def _is_nvn_or_1v1(dtype: str) -> bool:
@@ -323,6 +337,114 @@ def _prims_run(det, t, Hinv, w, h) -> list[dict]:
     return out
 
 
+def _prims_edge(det, t, Hinv, w, h, show_chip) -> list[dict]:
+    """'marking' | 'press_engage': a track ([(t,xa,ya,xb,yb),...]) -> a
+    polyline + defender-end disc, interpolated at t so it tracks the moving
+    pair (M6 MOVING-GEOMETRY convention)."""
+    g = _get(det, "geometry") or {}
+    v = interp_track(g.get("track"), t)
+    if v is None:
+        return []
+    xa, ya, xb, yb = v
+    dtype = _get(det, "type")
+    conf = float(_get(det, "confidence", 0.5) or 0.5)
+    color = COLOR_PRESS_ENGAGE if dtype == "press_engage" else COLOR_MARKING
+    pulse = 0.75 + 0.25 * math.sin(2 * math.pi * 2.0 * t) if dtype == "press_engage" else 1.0
+    alpha = float(np.clip(conf, 0.0, 1.0)) * pulse
+    pts = _proj(sample_polyline_m([(xa, ya), (xb, yb)]), Hinv, w, h)
+    if not pts:
+        return []
+    gid = _base_gid(det) + ":" + _players_tag(det)
+    out = [_prim(gid + ":line", "polyline", pts, _rgb(color), alpha=alpha, width=2)]
+    disc = _proj(circle_m(xa, ya, 0.5), Hinv, w, h)
+    if disc:
+        out.append(_prim(gid + ":disc", "circle", disc, _rgb(color), alpha=alpha, fill=True))
+    if show_chip:
+        label = "PRESS" if dtype == "press_engage" else "MARK"
+        out.append(_prim(gid + ":chip", "chip", [pts[-1]], _rgb(color), alpha=alpha, text=label))
+    return out
+
+
+def _select_edges(dets, t, cap=MAX_EDGES):
+    """Object/dict-tolerant twin of overlay.select_edges (that one indexes
+    dicts directly; here detections may be bto.core.Detection instances)."""
+    cands = [d for d in dets if _get(d, "type") in EDGE_TYPES
+             and _get(d, "t_start") <= t <= _get(d, "t_end")
+             and (_get(d, "confidence", 0.0) or 0.0) >= MIN_EVENT_CONF]
+    cands.sort(key=lambda d: -(_get(d, "confidence", 0.0) or 0.0))
+    return cands[:cap]
+
+
+def _prims_moving_play(det, t, Hinv, w, h, edge_lookup=None) -> list[dict]:
+    """'rotation' | 'overlap_run' | 'give_and_go' | 'third_man_run' |
+    'pressing_trap': any '*_path' entry draws as an arrow that grows along
+    the path up to t; a literal 'track'/'tracks' entry (forward-compat with
+    the general convention, unused by the current detectors) draws as a
+    thicker interpolated line. pressing_trap additionally cross-references
+    geometry['pressers'] (defender track_ids) against ``edge_lookup``
+    ({defender_tid: press_engage/marking Detection}, built by the caller
+    from the same detection stream -- plays.py's pressing_trap geometry
+    itself only carries the carrier's path, the real presser positions live
+    in their own edges) to draw the actual converging press edges thicker
+    plus a converging-triangle hint. One type-colored chip anchors on the
+    last drawn tip."""
+    dtype = _get(det, "type")
+    style = MOVING_PLAY_STYLE.get(dtype)
+    if style is None:
+        return []
+    a = _fade_alpha(det, t)
+    g = _get(det, "geometry") or {}
+    color = style["color"]
+    gid = _base_gid(det) + ":" + _players_tag(det)
+    out: list[dict] = []
+    tail = None
+
+    for name, samples in paths_in(g):
+        pts_m = path_prefix(samples, t)
+        if len(pts_m) < 2:
+            continue
+        pts = _proj(sample_polyline_m(pts_m), Hinv, w, h)
+        if pts:
+            out.append(_prim(f"{gid}:{name}", "arrow", pts, _rgb(color), alpha=a, width=3))
+            tail = pts[-1]
+
+    thick = 5 if dtype == "pressing_trap" else 3
+    tips = []
+    for i, track in enumerate(tracks_in(g)):
+        v = interp_track(track, t)
+        if v is None:
+            continue
+        xa, ya, xb, yb = v
+        pts = _proj(sample_polyline_m([(xa, ya), (xb, yb)]), Hinv, w, h)
+        if pts:
+            out.append(_prim(f"{gid}:track{i}", "polyline", pts, _rgb(color), alpha=a, width=thick))
+            tips.append(pts[0])
+            if tail is None:
+                tail = pts[-1]
+
+    if dtype == "pressing_trap" and edge_lookup:
+        for j, pid in enumerate(g.get("pressers") or []):
+            ed = edge_lookup.get(pid)
+            if ed is None:
+                continue
+            v = interp_track((_get(ed, "geometry") or {}).get("track"), t)
+            if v is None:
+                continue
+            xa, ya, xb, yb = v
+            pts = _proj(sample_polyline_m([(xa, ya), (xb, yb)]), Hinv, w, h)
+            if pts:
+                out.append(_prim(f"{gid}:presser{j}", "polyline", pts, _rgb(color), alpha=a, width=thick))
+                tips.append(pts[0])
+
+    if dtype == "pressing_trap" and len(tips) >= 2:
+        tri = tips[:3] if len(tips) >= 3 else tips + [tips[0]]
+        out.append(_prim(gid + ":converge", "polygon", tri, _rgb(color), alpha=0.15 * a, fill=True))
+
+    if style["chip"] and tail is not None:
+        out.append(_prim(gid + ":chip", "chip", [tail], _rgb(color), alpha=a, text=style["chip"]))
+    return out
+
+
 _EVENT_BUILDERS = {
     "back_pass": _prims_back_pass,
     "triangle": _prims_triangle,
@@ -330,13 +452,20 @@ _EVENT_BUILDERS = {
     "press": _prims_press,
     "overlap": _prims_run,
     "underlap": _prims_run,
+    "rotation": _prims_moving_play,
+    "overlap_run": _prims_moving_play,
+    "give_and_go": _prims_moving_play,
+    "third_man_run": _prims_moving_play,
+    "pressing_trap": _prims_moving_play,
 }
 
 
-def _event_prims(det, t, Hinv, w, h) -> list[dict]:
+def _event_prims(det, t, Hinv, w, h, edge_lookup=None) -> list[dict]:
     dtype = _get(det, "type")
     fn = _EVENT_BUILDERS.get(dtype)
     if fn is not None:
+        if dtype in MOVING_PLAY_TYPES:
+            return fn(det, t, Hinv, w, h, edge_lookup=edge_lookup)
         return fn(det, t, Hinv, w, h)
     if _is_nvn_or_1v1(dtype):
         return _prims_matchup(det, t, Hinv, w, h)
@@ -410,6 +539,21 @@ def detections_to_prims(detections, H=None, t=None, w=None, h=None) -> list[dict
     for d in newest_offside.values():
         out.extend(_prims_offside(d, t, Hinv, w, h))
 
+    # M6: persistent marking/press edges -- many-at-once and continuous
+    # (unlike the discrete "events" below), so they get their own
+    # strength-based cap instead of MAX_EVENTS; mirrors overlay.py's
+    # 'edges' layer (select_edges) exactly, just object/dict-tolerant.
+    for rank, d in enumerate(_select_edges(active, t)):
+        out.extend(_prims_edge(d, t, Hinv, w, h, show_chip=rank < EDGE_CHIP_TOP_N))
+
+    # defender_tid -> its active marking/press_engage edge, so pressing_trap
+    # can cross-reference geometry['pressers'] regardless of the edges-layer
+    # display cap above (a trap's own pressers should always be findable).
+    edge_lookup = {
+        _get(d, "players")[0]: d for d in active
+        if _get(d, "type") in EDGE_TYPES and _get(d, "players")
+    }
+
     # Precision-tuning selectivity (mirrors overlay.py's schedule pre-pass as
     # far as a stateless per-frame call allows): confidence floor + minimum
     # duration, with the same exemption for types whose lifetime is
@@ -426,7 +570,7 @@ def detections_to_prims(detections, H=None, t=None, w=None, h=None) -> list[dict
     events = sorted((d for d in active if _is_event(_get(d, "type")) and _keep_event(d)),
                     key=lambda d: -_get(d, "confidence", 0.0))
     for d in events[:MAX_EVENTS]:
-        out.extend(_event_prims(d, t, Hinv, w, h))
+        out.extend(_event_prims(d, t, Hinv, w, h, edge_lookup=edge_lookup))
 
     return out
 
@@ -569,6 +713,143 @@ def _build_fake_detections():
     return dets, t
 
 
+def _build_fake_moving_detections():
+    """One Detection per M6 moving-geometry type: 'marking'/'press_engage'
+    (a 'track', two points that move over time), 'rotation'/'overlap_run'/
+    'give_and_go'/'third_man_run' ('*_path'), and 'pressing_trap' (its own
+    'carrier_path' + a 'pressers' track_id list resolved against two
+    concurrent 'press_engage' edges -- the real plays.py contract).
+    Positions sweep across pitch meters over t in [9, 13] so a
+    multi-timestamp interpolation check has real movement to observe."""
+    t0, t1 = 9.0, 13.0
+    ts = [round(t0 + 0.5 * i, 2) for i in range(9)]  # 9.0, 9.5, ..., 13.0
+
+    def a(t):
+        return (30.0 + 4.0 * (t - t0), 30.0)
+
+    def b(t):
+        return (33.0 + 4.0 * (t - t0), 33.0)
+
+    dets = [
+        _fake_detection(
+            type="marking", players=["T40", "T41"],
+            geometry={"track": [(t, *a(t), *b(t)) for t in ts]},
+            confidence=0.8, t_start=t0, t_end=t1,
+        ),
+        _fake_detection(
+            type="press_engage", players=["T42", "T41"],
+            geometry={"track": [(t, *b(t), *a(t)) for t in ts]},
+            confidence=0.6, t_start=t0, t_end=t1,
+        ),
+        _fake_detection(
+            type="rotation", players=["T43", "T44"],
+            geometry={"a_path": [(t, 50 + 2 * (t - t0), 20 + 3 * (t - t0)) for t in ts],
+                      "b_path": [(t, 50 + 2 * (t - t0), 40 - 3 * (t - t0)) for t in ts],
+                      "roles": ["R3", "R4"]},
+            confidence=0.7, t_start=t0, t_end=t1,
+        ),
+        _fake_detection(
+            type="overlap_run", players=["T45"],
+            geometry={"run_path": [(t, 10 + 5 * (t - t0), 10.0) for t in ts]},
+            confidence=0.55, t_start=t0, t_end=t1,
+        ),
+        _fake_detection(
+            # real key from plays.py._give_and_gos: 'a_path'
+            type="give_and_go", players=["T46", "T47"],
+            geometry={"a_path": [(t, 60 - 3 * (t - t0), 50.0) for t in ts]},
+            confidence=0.5, t_start=t0, t_end=t1,
+        ),
+        _fake_detection(
+            type="third_man_run", players=["T48", "T49", "T50"],
+            geometry={"run_path": [(t, 70.0, 10 + 4 * (t - t0)) for t in ts]},
+            confidence=0.45, t_start=t0, t_end=t1,
+        ),
+        # pressing_trap's OWN geometry (plays.py._pressing_traps) is just the
+        # carrier's path + presser track_ids -- the real presser positions
+        # live in their own concurrently-active press_engage edges below,
+        # cross-referenced at render time via edge_lookup.
+        _fake_detection(
+            type="press_engage", players=["T54", "T51"],
+            geometry={"track": [(t, 80 - 2 * (t - t0), 40.0, 78 - 2 * (t - t0), 35.0) for t in ts]},
+            confidence=0.7, t_start=t0, t_end=t1,
+        ),
+        _fake_detection(
+            type="press_engage", players=["T55", "T51"],
+            geometry={"track": [(t, 80 - 2 * (t - t0), 30.0, 78 - 2 * (t - t0), 35.0) for t in ts]},
+            confidence=0.65, t_start=t0, t_end=t1,
+        ),
+        _fake_detection(
+            type="pressing_trap", players=["T51", "T54", "T55"],
+            geometry={
+                "carrier_path": [(t, 78 - 2 * (t - t0), 35.0) for t in ts],
+                "pressers": ["T54", "T55"],
+            },
+            confidence=0.65, t_start=t0, t_end=t1,
+        ),
+    ]
+    return dets, ts
+
+
+def _self_check_moving():
+    """M6: synthetic pitch<->pixel H (no external calib/video files) exercises
+    the new marking/press_engage/rotation/overlap_run/give_and_go/
+    third_man_run/pressing_trap prim builders: each yields >=1 prim in
+    isolation, and the always-on 'edges' marking prim interpolates smoothly
+    across 3 timestamps with a stable gid (pts differ, gid constant) -- the
+    guarantee the extension's client-side lerp depends on."""
+    import os
+
+    w, h = 1200, 800
+    Hinv = np.array([[10.0, 0.0, 50.0], [0.0, -10.0, 700.0], [0.0, 0.0, 1.0]])
+    H = np.linalg.inv(Hinv).flatten().tolist()
+
+    dets, ts = _build_fake_moving_detections()
+    t0, t_mid, t_last = ts[0], ts[len(ts) // 2], ts[-1]
+
+    by_type: dict[str, list] = {}
+    for d in dets:
+        by_type.setdefault(d.type, []).append(d)
+    for dtype, dlist in by_type.items():
+        p1 = detections_to_prims(dlist, H, t_mid, w, h)
+        assert p1, f"no prim produced for M6 type={dtype}"
+        for p in p1:
+            assert p["pts"], f"empty pts in prim {p['gid']} (type={dtype})"
+            for x, y in p["pts"]:
+                assert np.isfinite(x) and np.isfinite(y), f"non-finite pt in prim {p['gid']}"
+
+    # interpolation check across 3 timestamps, via the combined per-frame
+    # call (real usage): marking is an 'edges' prim (not MAX_EVENTS-capped),
+    # so it is present at every t -- gid must stay constant, pts must move.
+    frames_prims = [detections_to_prims(dets, H, t, w, h) for t in (t0, t_mid, t_last)]
+    marking_lines = [
+        next(p for p in prims if p["gid"].startswith("marking:") and p["gid"].endswith(":line"))
+        for prims in frames_prims
+    ]
+    gids = {p["gid"] for p in marking_lines}
+    assert len(gids) == 1, f"marking gid should be stable across t, got {gids}"
+    pts_by_frame = [tuple(map(tuple, p["pts"])) for p in marking_lines]
+    assert pts_by_frame[0] != pts_by_frame[1], "marking prim did not move t0->t_mid"
+    assert pts_by_frame[1] != pts_by_frame[2], "marking prim did not move t_mid->t_last"
+    assert pts_by_frame[0] != pts_by_frame[2], "marking prim did not move t0->t_last"
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    out_dir = os.path.join(root, "out", "m6_selfcheck")
+    os.makedirs(out_dir, exist_ok=True)
+    blank = np.full((h, w, 3), (40, 110, 40), dtype=np.uint8)
+    saved = []
+    for i, prims in enumerate(frames_prims):
+        debug = prims_render_debug(blank, prims)
+        p = os.path.join(out_dir, f"primitives_moving_selfcheck_t{i}.jpg")
+        cv2.imwrite(p, debug)
+        saved.append(p)
+
+    moved_px = math.dist(pts_by_frame[0][0], pts_by_frame[-1][0])
+    print(f"SELF-CHECK (moving) OK: {len(dets)} M6 types, gid stable, "
+          f"marking moved {moved_px:.1f}px across t")
+    for p in saved:
+        print("sample:", p)
+
+
 def _self_check():
     import json
     import os
@@ -632,3 +913,4 @@ def _self_check():
 
 if __name__ == "__main__":
     _self_check()
+    _self_check_moving()

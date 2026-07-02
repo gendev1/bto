@@ -55,6 +55,10 @@ import numpy as np
 
 from bto.core import AWAY, HOME, Detection, Frame, PlayerPos
 from bto.patterns import run_all
+from bto.patterns.formation import detect_block, detect_formation
+from bto.patterns.matchups import detect_isolations
+from bto.patterns.offside import offside_line
+from bto.patterns.passing import detect_back_passes
 from bto.vision import calib as _calib
 from bto.vision import teams as _teams
 from bto.vision.ball import KalmanBall
@@ -368,6 +372,20 @@ class _LiveBridge:
 # ---------------------------------------------------------------------------
 
 
+# M6 patterns split for the live path: these detectors are cheap (~4ms total
+# on a full 15s buffer) and rerun every pattern tick; everything else --
+# roles/edges/plays/matchups/pressing/triangles/runs, i.e. every type NOT in
+# _CHEAP_TYPES -- comes from the last full run_all (see relational_every).
+_CHEAP_DETECTORS = (
+    detect_formation,
+    detect_block,
+    offside_line,
+    detect_back_passes,
+    detect_isolations,
+)
+_CHEAP_TYPES = {"formation", "block", "offside_line", "back_pass", "isolation"}
+
+
 class StreamPipeline:
     """Loads both models once; process(frame_bgr, t) -> dict with keys
     shot, H (np 3x3 or None), calib_src, frames_appended, detections
@@ -380,10 +398,17 @@ class StreamPipeline:
         calib_every: int = 4,   # M5 tune: 5 x ~0.4s live frame gap ~= HOLD_MAX_S
                                 # (2.0s), so one failed fit == instant hold expiry
                                 # (null-H flash); 4 keeps a failed fit inside hold
-        patterns_every: int = 1,  # M5 tune: run_all is ~1ms on a full buffer --
-                                  # running it every processed main frame keeps
-                                  # geometry fresh (was 3: overlay data went up
-                                  # to ~1.2s stale between runs at ~2.6 proc fps)
+        patterns_every: int = 1,  # M5 tune: cheap detectors are ~4ms on a full
+                                  # buffer -- running them every processed main
+                                  # frame keeps geometry fresh (was 3: overlay
+                                  # data went up to ~1.2s stale between runs)
+        relational_every: int = 5,  # M6: the full run_all (roles Hungarian +
+                                    # edge state machine + plays) is ~55ms on a
+                                    # full 15s/22-player buffer; recompute it
+                                    # every N pattern ticks and reuse the
+                                    # relational Detections in between (their
+                                    # geometry carries (t,...) tracks, so the
+                                    # renderer keeps interpolating them)
         buffer_s: float = 15.0,
         warmup_crops: int = 80,
         conf: float = 0.3,
@@ -400,6 +425,7 @@ class StreamPipeline:
         self.conf = conf
         self.calib_every = calib_every
         self.patterns_every = patterns_every
+        self.relational_every = relational_every
         self.buffer_s = buffer_s
         self.det_grace_s = det_grace_s
 
@@ -425,6 +451,11 @@ class StreamPipeline:
         self._since_fit = 0
         self._since_patterns = 0
         self._cached_dets: list[Detection] = []
+        # M6 relational amortization: full run_all every `relational_every`
+        # pattern ticks; between them only _CHEAP_DETECTORS rerun and the
+        # relational Detections from the last full run are reused.
+        self._since_full = 10**9  # force a full run on the first tick
+        self._relational_cache: list[Detection] = []
 
         # cumulative per-stage timings [ms] for reporting
         self.stage_ms: dict[str, float] = defaultdict(float)
@@ -444,6 +475,8 @@ class StreamPipeline:
         self._cached_dets = []
         self._since_fit = 0
         self._since_patterns = 0
+        self._since_full = 10**9
+        self._relational_cache = []
 
     # -- per-stage helpers ---------------------------------------------------
 
@@ -583,7 +616,23 @@ class StreamPipeline:
         t0 = time.perf_counter()
         self._since_patterns += 1
         if self._buffer and self._since_patterns >= self.patterns_every:
-            self._cached_dets = run_all(self._buffer)
+            self._since_full += 1
+            if self._since_full >= self.relational_every:
+                self._cached_dets = run_all(self._buffer)  # full M6 pipeline
+                self._relational_cache = [
+                    d for d in self._cached_dets if d.type not in _CHEAP_TYPES
+                ]
+                self._since_full = 0
+            else:
+                dets: list[Detection] = []
+                for det in _CHEAP_DETECTORS:
+                    dets.extend(det(self._buffer))
+                horizon = self._buffer[0].t
+                dets.extend(
+                    d for d in self._relational_cache if d.t_end >= horizon
+                )
+                dets.sort(key=lambda d: d.t_start)
+                self._cached_dets = dets
             self._since_patterns = 0
         active = [
             d for d in self._cached_dets

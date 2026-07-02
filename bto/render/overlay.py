@@ -44,10 +44,36 @@ COLOR_NVN = (255, 255, 0)
 COLOR_RUN = (0, 255, 180)
 PRESS_COLORS = {"low": (80, 200, 80), "medium": (0, 165, 255), "high": (0, 0, 255)}
 
+# ---- M6 relational layer: persistent edges (marking/press) + play grammar
+# (rotation/overlap_run/give_and_go/third_man_run/pressing_trap). All draw
+# INTERPOLATED at the current frame t per the MOVING-GEOMETRY convention
+# (see interp_track below) so lines/arrows move with the players instead of
+# blinking on/off -- the whole point of M6 over M4's static-geometry events.
+COLOR_MARKING = (110, 130, 90)        # muted olive: defending-side edge, low-key
+COLOR_PRESS_ENGAGE = (0, 100, 255)    # warm orange-red: urgent, on-ball press
+COLOR_ROTATION = (255, 0, 200)
+COLOR_OVERLAP_RUN = (0, 255, 160)
+COLOR_GIVE_AND_GO = (255, 190, 0)
+COLOR_THIRD_MAN = (200, 255, 0)
+COLOR_TRAP = (0, 0, 255)
+
+EDGE_TYPES = {"marking", "press_engage"}
+MAX_EDGES = 4          # concurrent marking/press_engage edges drawn, by strength
+EDGE_CHIP_TOP_N = 2    # only the strongest N of those get a label chip
+
+MOVING_PLAY_STYLE = {
+    "rotation": dict(color=COLOR_ROTATION, chip="ROTATION"),
+    "overlap_run": dict(color=COLOR_OVERLAP_RUN, chip="OVERLAP"),
+    "give_and_go": dict(color=COLOR_GIVE_AND_GO, chip="GIVE & GO"),
+    "third_man_run": dict(color=COLOR_THIRD_MAN, chip="THIRD MAN"),
+    "pressing_trap": dict(color=COLOR_TRAP, chip="PRESSING TRAP"),
+}
+MOVING_PLAY_TYPES = set(MOVING_PLAY_STYLE)
+
 FADE_S = 0.3          # fade window at detection + shot boundaries
 MAX_EVENTS = 2        # simultaneous event callouts, by confidence
 SAMPLE_STEP_M = 1.5   # polyline sampling step in meter space
-DEFAULT_LAYERS = ("formation", "offside", "events")
+DEFAULT_LAYERS = ("formation", "offside", "events", "edges")
 EVENT_TYPES_STATIC = {"back_pass", "triangle", "isolation", "press", "overlap", "underlap"}
 
 # ---- event selectivity (precision-tuning pass: the audited FP spam was
@@ -56,8 +82,10 @@ EVENT_TYPES_STATIC = {"back_pass", "triangle", "isolation", "press", "overlap", 
 MIN_EVENT_CONF = 0.35     # drop event callouts below this confidence
 EVENT_COOLDOWN_S = 8.0    # min gap between same-type callouts (display end -> next start)
 MIN_EVENT_DUR_S = 0.4     # drop events shorter than this ...
-MIN_EVENT_DUR_EXEMPT = {"back_pass", "overlap", "underlap"}  # ... except types whose
-# lifetime is inherently the short ball-flight / run window
+MIN_EVENT_DUR_EXEMPT = {
+    "back_pass", "overlap", "underlap",
+    "overlap_run", "give_and_go", "third_man_run",  # M6: short ball-flight/run windows too
+}  # ... except types whose lifetime is inherently the short ball-flight / run window
 MIN_DISPLAY_S = 1.5       # stretch every kept event to at least this on screen
 
 # ---- offside selectivity (audit: geometry accurate but BOTH teams' lines
@@ -92,7 +120,8 @@ def _is_nvn(dtype):
 
 
 def _is_event(dtype):
-    return dtype in EVENT_TYPES_STATIC or dtype == "1v1" or _is_nvn(dtype)
+    return (dtype in EVENT_TYPES_STATIC or dtype in MOVING_PLAY_TYPES
+            or dtype == "1v1" or _is_nvn(dtype))
 
 
 # ---------------------------------------------------------------- projection
@@ -133,6 +162,74 @@ def sample_polyline_m(pts_m, closed=False, step=SAMPLE_STEP_M):
 def circle_m(cx, cy, r, n=28):
     return [(cx + r * math.cos(2 * math.pi * i / n), cy + r * math.sin(2 * math.pi * i / n))
             for i in range(n + 1)]
+
+
+# ------------------------------------------------------- M6 moving geometry
+#
+# MOVING-GEOMETRY RENDER CONVENTION: any Detection whose geometry has a
+# 'track' ([(t, xa, ya, xb, yb), ...], a two-endpoint edge) or a '*_path'
+# key ([(t, x, y), ...], a single point over time) is drawn INTERPOLATED at
+# the current frame t -- the line/marker moves with the players instead of
+# snapping between stale keyframes. This helper is written once here and
+# imported by pitch.py and host/primitives.py so all three renderers agree.
+
+def interp_track(samples, t):
+    """Linearly interpolate a 'track' or '*_path' sample list at time t.
+
+    ``samples`` is [(t, v0, v1, ...), ...] (a 'track' has 4 trailing values
+    xa,ya,xb,yb; a '*_path' has 2, x,y). Returns a tuple of the trailing
+    values at t, clamped to the first/last sample outside the window, or
+    None if samples is empty.
+    """
+    if not samples:
+        return None
+    s = sorted(samples, key=lambda r: r[0])
+    if t <= s[0][0]:
+        return tuple(s[0][1:])
+    if t >= s[-1][0]:
+        return tuple(s[-1][1:])
+    for (t0, *v0), (t1, *v1) in zip(s, s[1:]):
+        if t0 <= t <= t1:
+            f = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+            return tuple(a + f * (b - a) for a, b in zip(v0, v1))
+    return tuple(s[-1][1:])
+
+
+def paths_in(geometry):
+    """All '*_path' entries of a geometry dict, as (name, samples), name-sorted
+    for deterministic draw order (e.g. rotation's a_path/b_path)."""
+    return sorted(
+        ((k, v) for k, v in (geometry or {}).items() if k.endswith("_path") and v),
+        key=lambda kv: kv[0],
+    )
+
+
+def tracks_in(geometry):
+    """All 'track'-shaped edges of a geometry dict: the single 'track' plus
+    any 'tracks' list (pressing_trap's multiple converging press edges)."""
+    g = geometry or {}
+    out = []
+    if g.get("track"):
+        out.append(g["track"])
+    for tr in g.get("tracks") or []:
+        if tr:
+            out.append(tr)
+    return out
+
+
+def path_prefix(samples, t):
+    """Points of a '*_path' sample list from its start up to time t
+    (inclusive), so an arrow can grow along the path as t advances.
+    Clamped: t before the path returns just the first point; t after
+    returns the whole path."""
+    if not samples:
+        return []
+    s = sorted(samples, key=lambda r: r[0])
+    pts = [(x, y) for (ts, x, y) in s if ts <= t]
+    cur = interp_track(s, t)
+    if cur is not None and (not pts or cur != pts[-1]):
+        pts.append(cur)
+    return pts or [tuple(s[0][1:])]
 
 
 def _runs(px):
@@ -377,6 +474,148 @@ def draw_event(canvas, det, t, Hinv, w, h, seg_alpha, disp=None):
     return canvas
 
 
+def draw_edge(canvas, det, t, Hinv, w, h, seg_alpha, chip=True):
+    """'marking' | 'press_engage': a track ([(t,xa,ya,xb,yb),...]) drawn as
+    a solid line defender(a)->attacker(b), a small disc at the defender
+    end, interpolated at t so it tracks the moving pair. Alpha is scaled by
+    the edge's own strength (confidence); press_engage additionally pulses."""
+    g = det["geometry"]
+    v = interp_track(g.get("track"), t)
+    if v is None:
+        return canvas
+    xa, ya, xb, yb = v
+    kind = det["type"]
+    color = COLOR_PRESS_ENGAGE if kind == "press_engage" else COLOR_MARKING
+    pulse = 0.75 + 0.25 * math.sin(2 * math.pi * 2.0 * t) if kind == "press_engage" else 1.0
+    strength = float(np.clip(det.get("confidence", 0.5), 0.0, 1.0))
+    a = seg_alpha * strength * pulse
+    px = project(sample_polyline_m([(xa, ya), (xb, yb)]), Hinv, w, h)
+
+    def d(im):
+        _poly_runs(im, px, color, 2)
+        runs = _runs(px)
+        if runs:
+            cv2.circle(im, tuple(runs[0][0]), 4, color, -1, cv2.LINE_AA)
+    canvas = _blend(canvas, d, a)
+
+    if chip:
+        runs = _runs(px)
+        if runs:
+            tail = runs[-1][-1]
+            label = "PRESS" if kind == "press_engage" else "MARK"
+            canvas = _blend(canvas, lambda im: _chip(im, label, (tail[0] + 6, tail[1] - 6), color, 0.42), a)
+    return canvas
+
+
+def select_edges(dets, t, cap=MAX_EDGES):
+    """EDGE_TYPES detections active at t, above the shared confidence floor,
+    sorted by strength (confidence) desc, capped at ``cap`` (avoids spaghetti
+    when many defenders are marking at once). Callers give a chip to the
+    first EDGE_CHIP_TOP_N of the returned list."""
+    cands = [d for d in dets if d["type"] in EDGE_TYPES
+             and d["t_start"] <= t <= d["t_end"]
+             and d.get("confidence", 0.0) >= MIN_EVENT_CONF]
+    cands.sort(key=lambda d: -d.get("confidence", 0.0))
+    return cands[:cap]
+
+
+def draw_moving_play(canvas, det, t, Hinv, w, h, seg_alpha, disp=None, edge_lookup=None):
+    """'rotation' | 'overlap_run' | 'give_and_go' | 'third_man_run' |
+    'pressing_trap': generic MOVING-GEOMETRY play drawer. Any '*_path' entry
+    is drawn as an arrow that grows along the path up to t (rotation's
+    a_path/b_path render as two such arrows -- the path itself already
+    curves through the swap, no separate bezier needed); any literal
+    'track' / 'tracks' entries draw as thicker interpolated lines (forward
+    compatible with the general convention, unused by the current
+    detectors). pressing_trap additionally cross-references its
+    geometry['pressers'] (defender track_ids) against ``edge_lookup``
+    ({defender_tid: press_engage/marking Detection} for edges active this
+    frame, built by the caller from the SAME detection stream) to draw the
+    actual converging press edges thicker plus a converging-triangle hint
+    -- that's where the real defender positions live (plays.py's
+    pressing_trap geometry itself only carries the carrier's path). A
+    single type-colored chip anchors on the last-drawn tip."""
+    dtype = det["type"]
+    style = MOVING_PLAY_STYLE.get(dtype)
+    if style is None:
+        return canvas
+    a = _det_alpha(det, t, disp) * seg_alpha
+    g = det["geometry"]
+    color = style["color"]
+    tail_px = None
+
+    for _name, samples in paths_in(g):
+        pts_m = path_prefix(samples, t)
+        if len(pts_m) < 2:
+            continue
+        px = project(sample_polyline_m(pts_m), Hinv, w, h)
+
+        def d(im, px=px):
+            runs = _runs(px)
+            for run in runs:
+                cv2.polylines(im, [run], False, color, 3, cv2.LINE_AA)
+            if runs and len(runs[-1]) >= 2:
+                tail = runs[-1]
+                cv2.arrowedLine(im, tuple(tail[-2]), tuple(tail[-1]), color, 3, cv2.LINE_AA, tipLength=2.0)
+        canvas = _blend(canvas, d, a)
+        if len(px):
+            tail_px = px[-1]
+
+    thick = 5 if dtype == "pressing_trap" else 3
+    converge_tips = []
+    for track in tracks_in(g):  # forward-compat: a literal 'track'/'tracks' key
+        v = interp_track(track, t)
+        if v is None:
+            continue
+        xa, ya, xb, yb = v
+        px = project(sample_polyline_m([(xa, ya), (xb, yb)]), Hinv, w, h)
+
+        def d(im, px=px):
+            _poly_runs(im, px, color, thick)
+        canvas = _blend(canvas, d, a)
+        p0 = project([(xa, ya)], Hinv, w, h)[0]
+        if np.isfinite(p0).all():
+            converge_tips.append(p0)
+        if tail_px is None:
+            p1 = project([(xb, yb)], Hinv, w, h)[0]
+            if np.isfinite(p1).all():
+                tail_px = p1
+
+    if dtype == "pressing_trap" and edge_lookup:
+        for pid in g.get("pressers") or []:
+            ed = edge_lookup.get(pid)
+            if ed is None:
+                continue
+            v = interp_track(ed["geometry"].get("track"), t)
+            if v is None:
+                continue
+            xa, ya, xb, yb = v
+            px = project(sample_polyline_m([(xa, ya), (xb, yb)]), Hinv, w, h)
+
+            def d(im, px=px):
+                _poly_runs(im, px, color, thick)
+            canvas = _blend(canvas, d, a)
+            p0 = project([(xa, ya)], Hinv, w, h)[0]
+            if np.isfinite(p0).all():
+                converge_tips.append(p0)
+
+    if dtype == "pressing_trap" and len(converge_tips) >= 2:
+        tri = converge_tips[:3] if len(converge_tips) >= 3 else converge_tips + [converge_tips[0]]
+        tri = np.asarray(tri, dtype=np.float64)
+
+        def d(im):
+            if np.isfinite(tri).all() and len(tri) >= 3:
+                cv2.fillPoly(im, [tri.astype(np.int32)], color, cv2.LINE_AA)
+        canvas = _blend(canvas, d, 0.15 * a)
+
+    if style["chip"] and tail_px is not None and np.isfinite(tail_px).all():
+        canvas = _blend(
+            canvas,
+            lambda im: _chip(im, style["chip"], (tail_px[0] + 8, tail_px[1] - 8), color),
+            a)
+    return canvas
+
+
 # ------------------------------------------------------------- selectivity
 
 def schedule_events(detections):
@@ -570,6 +809,10 @@ def render_overlay_video(video_path, out_dir, out_path=None, layers=None, max_fr
             seg_alpha = float(np.clip(
                 min(t - run_start[idx] + dt, run_end[idx] - t + dt) / FADE_S, 0.15, 1.0))
             active = [d for d in dets_sorted if d["t_start"] <= t <= d["t_end"]]
+            # M6: defender_tid -> its active marking/press_engage edge, for
+            # pressing_trap to cross-reference its geometry['pressers'].
+            edge_lookup = {d["players"][0]: d for d in active
+                           if d["type"] in EDGE_TYPES and d.get("players")}
 
             if "formation" in layers:
                 for d in active:
@@ -620,6 +863,16 @@ def render_overlay_video(video_path, out_dir, out_path=None, layers=None, max_fr
                     if drew:
                         draw_counts["offside"] += 1
 
+            if "edges" in layers:
+                # M6: persistent marking/press edges -- unlike "events" these
+                # are many-at-once and continuous, so they get their own cap
+                # (by strength) instead of the MAX_EVENTS scheduler.
+                kept_edges = select_edges(dets_sorted, t)
+                for rank, d in enumerate(kept_edges):
+                    canvas = draw_edge(canvas, d, t, Hinv, w, h, seg_alpha, chip=rank < EDGE_CHIP_TOP_N)
+                    draw_counts["edges"] += 1
+                    draw_counts[f"edges.{d['type']}"] += 1
+
             if "events" in layers:
                 sched = [(d, event_windows[id(d)]) for d in dets_sorted
                          if id(d) in event_windows
@@ -627,7 +880,11 @@ def render_overlay_video(video_path, out_dir, out_path=None, layers=None, max_fr
                 events = sorted(sched, key=lambda dw: -dw[0]["confidence"])[:MAX_EVENTS]
                 ev_tids = set()
                 for d, disp in events:
-                    canvas = draw_event(canvas, d, t, Hinv, w, h, seg_alpha, disp=disp)
+                    if d["type"] in MOVING_PLAY_TYPES:
+                        canvas = draw_moving_play(canvas, d, t, Hinv, w, h, seg_alpha, disp=disp,
+                                                   edge_lookup=edge_lookup)
+                    else:
+                        canvas = draw_event(canvas, d, t, Hinv, w, h, seg_alpha, disp=disp)
                     draw_counts["events"] += 1
                     draw_counts[f"events.{d['type']}"] += 1
                     for pid in d["players"]:
@@ -690,5 +947,127 @@ def _self_check():
     print(f"SELF-CHECK OK: {dst} {size} bytes, draw_counts={stats['draw_counts']}")
 
 
+def _self_check_moving():
+    """M6: synthetic clip exercising the new MOVING-GEOMETRY types (marking/
+    press_engage edges + rotation/overlap_run/give_and_go/third_man_run/
+    pressing_trap play events). No perception/calib file scaffolding needed
+    -- draws directly with draw_edge/draw_moving_play onto a blank canvas
+    via a fixed synthetic pitch<->pixel Hinv (same project() machinery
+    render_overlay_video uses), and separately unit-checks the edges
+    cap/selection logic that render_overlay_video wires in as layer 'edges'.
+    """
+    w, h = 1200, 800
+    Hinv = np.array([[10.0, 0.0, 50.0], [0.0, -10.0, 700.0], [0.0, 0.0, 1.0]])
+
+    n, dt = 40, 0.1
+    ts = [round(i * dt, 3) for i in range(n)]
+    t_end = ts[-1]
+
+    def a(t):
+        return (20.0 + 6.0 * t, 30.0)
+
+    def b(t):
+        return (25.0 + 6.0 * t, 34.0)
+
+    marking = {"type": "marking", "players": ["A1", "B1"],
+               "geometry": {"track": [(t, *a(t), *b(t)) for t in ts]},
+               "confidence": 0.85, "t_start": 0.0, "t_end": t_end}
+    press = {"type": "press_engage", "players": ["A2", "B1"],
+             "geometry": {"track": [(t, *b(t), *a(t)) for t in ts]},
+             "confidence": 0.6, "t_start": 0.0, "t_end": t_end}
+    rotation = {"type": "rotation", "players": ["A3", "A4"],
+                "geometry": {"a_path": [(t, 40 + 3 * t, 20 + 2 * t) for t in ts],
+                             "b_path": [(t, 40 + 3 * t, 45 - 2 * t) for t in ts],
+                             "roles": ["R3", "R4"]},
+                "confidence": 0.7, "t_start": 0.0, "t_end": t_end}
+    overlap_run = {"type": "overlap_run", "players": ["A5"],
+                   "geometry": {"run_path": [(t, 10 + 8 * t, 10.0) for t in ts]},
+                   "confidence": 0.55, "t_start": 0.0, "t_end": t_end}
+    give_and_go = {"type": "give_and_go", "players": ["A6", "A7"],
+                   # real key from plays.py._give_and_gos: 'a_path'
+                   "geometry": {"a_path": [(t, 60 - 4 * t, 50.0) for t in ts]},
+                   "confidence": 0.5, "t_start": 0.0, "t_end": t_end}
+    third_man = {"type": "third_man_run", "players": ["A8", "A9", "A10"],
+                 "geometry": {"run_path": [(t, 70.0, 10 + 5 * t) for t in ts]},
+                 "confidence": 0.45, "t_start": 0.0, "t_end": t_end}
+
+    # pressing_trap's OWN geometry (plays.py._pressing_traps) is just the
+    # carrier's path + a list of presser track_ids -- the actual presser
+    # positions live in their own concurrently-active press_engage edges,
+    # cross-referenced at render time via edge_lookup.
+    def c(t):
+        return (60.0 - 2.0 * t, 34.0)
+
+    def d1(t):
+        return (58.0 - 1.5 * t, 30.0)
+
+    def d2(t):
+        return (58.0 - 1.5 * t, 38.0)
+
+    press_d1 = {"type": "press_engage", "players": ["D1", "C1"],
+                "geometry": {"track": [(t, *d1(t), *c(t)) for t in ts]},
+                "confidence": 0.7, "t_start": 0.0, "t_end": t_end}
+    press_d2 = {"type": "press_engage", "players": ["D2", "C1"],
+                "geometry": {"track": [(t, *d2(t), *c(t)) for t in ts]},
+                "confidence": 0.65, "t_start": 0.0, "t_end": t_end}
+    trap = {"type": "pressing_trap", "players": ["C1", "D1", "D2"],
+            "geometry": {"carrier_path": [(t, *c(t)) for t in ts], "pressers": ["D1", "D2"]},
+            "confidence": 0.75, "t_start": 0.0, "t_end": t_end}
+    edge_lookup = {"D1": press_d1, "D2": press_d2}
+
+    # -- pure-function check: edges cap/selection (independent of drawing) --
+    many_edges = [
+        {"type": "marking", "players": [f"X{i}", "Y"], "geometry": {"track": [(0.0, 0, 0, 1, 1)]},
+         "confidence": round(0.3 + 0.1 * i, 2), "t_start": 0.0, "t_end": 1.0}
+        for i in range(6)
+    ]
+    kept = select_edges(many_edges, 0.5)
+    assert len(kept) == MAX_EDGES, f"expected {MAX_EDGES} kept edges, got {len(kept)}"
+    assert [d["confidence"] for d in kept] == sorted(
+        (d["confidence"] for d in many_edges), reverse=True)[:MAX_EDGES]
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    out_dir = os.path.join(root, "out", "m6_selfcheck")
+    os.makedirs(out_dir, exist_ok=True)
+    dst = os.path.join(out_dir, "m6_moving_selfcheck.mp4")
+    writer = cv2.VideoWriter(dst, cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (w, h))
+
+    marking_px_by_frame = []
+    samples = {}
+    for idx, t in enumerate(ts):
+        canvas = np.full((h, w, 3), (40, 110, 40), dtype=np.uint8)
+        canvas = draw_edge(canvas, marking, t, Hinv, w, h, 1.0, chip=True)
+        canvas = draw_edge(canvas, press, t, Hinv, w, h, 1.0, chip=True)
+        canvas = draw_edge(canvas, press_d1, t, Hinv, w, h, 1.0, chip=False)
+        canvas = draw_edge(canvas, press_d2, t, Hinv, w, h, 1.0, chip=False)
+        for d in (rotation, overlap_run, give_and_go, third_man):
+            canvas = draw_moving_play(canvas, d, t, Hinv, w, h, 1.0)
+        canvas = draw_moving_play(canvas, trap, t, Hinv, w, h, 1.0, edge_lookup=edge_lookup)
+        writer.write(canvas)
+        if idx in (0, n // 2, n - 1):
+            p = os.path.join(out_dir, f"m6_moving_f{idx}.jpg")
+            cv2.imwrite(p, canvas)
+            samples[idx] = p
+        v = interp_track(marking["geometry"]["track"], t)
+        px = project([(v[0], v[1])], Hinv, w, h)[0]
+        marking_px_by_frame.append(tuple(px))
+    writer.release()
+
+    assert os.path.exists(dst), "moving-geometry self-check mp4 missing"
+    size = os.path.getsize(dst)
+    assert size > 20_000, f"moving-geometry self-check mp4 too small: {size} bytes"
+
+    # the marking edge must visibly move across the clip (defender walks
+    # ~24m of synthetic pitch): pixel position at frame 0 vs frame n-1.
+    p0, p1 = marking_px_by_frame[0], marking_px_by_frame[-1]
+    dist = math.dist(p0, p1)
+    assert dist > 100, f"marking edge did not move across frames ({dist:.1f}px)"
+
+    print(f"SELF-CHECK (moving) OK: {dst} {size} bytes, marking moved {dist:.1f}px")
+    for idx, p in samples.items():
+        print("sample:", p)
+
+
 if __name__ == "__main__":
     _self_check()
+    _self_check_moving()

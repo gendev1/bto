@@ -41,6 +41,20 @@ bto/patterns/{matchups,runs,pressing,formation,offside,passing}.py):
   offside_line: x=float (pitch-meter line position; "line_x" also accepted)
                 -- dashed vertical line + an explicit "approx offside" label
                 (SPEC: never present this as an actual call).
+
+M6 relational layer -- MOVING-GEOMETRY types (bto.patterns.roles/edges +
+the play grammar on top). Per the convention (see bto.render.overlay's
+interp_track/paths_in/tracks_in): any geometry with a 'track'
+([(t,xa,ya,xb,yb),...]) or a '*_path' ([(t,x,y),...]) key is interpolated
+at the current frame's t, so the drawn line/arrow MOVES with the players
+instead of snapping between stale keyframes:
+  marking / press_engage: geometry.track -- a defender(a)->attacker(b) edge,
+                drawn as a moving line + a dot at the defender end.
+  rotation / overlap_run / give_and_go / third_man_run / pressing_trap:
+                geometry's '*_path' entries (rotation's a_path/b_path,
+                overlap_run's run_path, ...) each draw as an arrow grown up
+                to t; pressing_trap's 'tracks' (converging press edges)
+                draw as thicker moving lines.
 """
 
 import re
@@ -54,12 +68,26 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.patches import Arc, Circle, FancyArrowPatch, Polygon, Rectangle
 
 from bto.core import AWAY, Detection, Frame, HOME, PITCH_LENGTH, PITCH_WIDTH
+from bto.render.overlay import MOVING_PLAY_STYLE, interp_track, path_prefix, paths_in, tracks_in
 
 HOME_COLOR = "#e63946"
 AWAY_COLOR = "#457bff"
 BALL_COLOR = "black"
 LINE_COLOR = "white"
 PITCH_COLOR = "#2e7d32"
+
+# M6: edges + play grammar (BGR ints from overlay.py aren't used here --
+# matplotlib wants its own color strings, so these are hand-picked
+# equivalents of the same hue family as overlay.py's constants).
+MARKING_COLOR = "#8a9a5a"
+PRESS_ENGAGE_COLOR = "#ff6a00"
+MOVING_PLAY_COLORS = {
+    "rotation": "magenta",
+    "overlap_run": "springgreen",
+    "give_and_go": "gold",
+    "third_man_run": "yellowgreen",
+    "pressing_trap": "red",
+}
 
 _NVN_RE = re.compile(r"^\d+v\d+$")
 _BACK_PASS_DISPLAY_S = 1.5
@@ -239,6 +267,54 @@ def _draw_offside_line(ax, d: Detection, frame: Frame) -> None:
     ax.text(x + 0.5, PITCH_WIDTH - 3, "approx offside", fontsize=6, color="yellow", zorder=6)
 
 
+def _draw_edge(ax, d: Detection, frame: Frame) -> None:
+    """'marking' | 'press_engage': geometry.track interpolated at frame.t."""
+    v = interp_track(d.geometry.get("track"), frame.t)
+    if v is None:
+        return
+    xa, ya, xb, yb = v
+    color = PRESS_ENGAGE_COLOR if d.type == "press_engage" else MARKING_COLOR
+    alpha = max(min(d.confidence, 1.0), 0.2)
+    ax.plot([xa, xb], [ya, yb], "-", color=color, lw=1.6, alpha=alpha, zorder=4)
+    ax.plot([xa], [ya], "o", color=color, ms=5, zorder=5)
+
+
+def _draw_moving_play(ax, d: Detection, frame: Frame) -> None:
+    """'rotation' | 'overlap_run' | 'give_and_go' | 'third_man_run' |
+    'pressing_trap': every '*_path' entry grows an arrow up to frame.t
+    (pressing_trap's carrier_path draws thicker -- the "simple version" of
+    the emphasis overlay.py/primitives.py add via their fuller
+    presser-edge cross-reference + converging-triangle hint); a literal
+    'track'/'tracks' entry (forward-compat, unused by the current
+    detectors) draws as a thicker moving line too."""
+    color = MOVING_PLAY_COLORS.get(d.type, "white")
+    g = d.geometry
+    lw = 3.0 if d.type == "pressing_trap" else 1.4
+    tail = None
+    for _name, samples in paths_in(g):
+        pts = path_prefix(samples, frame.t)
+        if len(pts) < 2:
+            continue
+        xs, ys = zip(*pts)
+        ax.plot(xs, ys, "-", color=color, lw=lw, alpha=0.85, zorder=4)
+        ax.add_patch(FancyArrowPatch(pts[-2], pts[-1], arrowstyle="-|>",
+                                      mutation_scale=9, color=color, lw=1.2, alpha=0.9, zorder=6))
+        tail = pts[-1]
+
+    for track in tracks_in(g):
+        v = interp_track(track, frame.t)
+        if v is None:
+            continue
+        xa, ya, xb, yb = v
+        ax.plot([xa, xb], [ya, yb], "-", color=color, lw=lw, alpha=0.85, zorder=4)
+        if tail is None:
+            tail = (xb, yb)
+
+    chip = (MOVING_PLAY_STYLE.get(d.type) or {}).get("chip")
+    if chip and tail is not None:
+        ax.text(tail[0] + 0.6, tail[1] + 0.6, chip, fontsize=6, color=color, zorder=6)
+
+
 _DRAW_BY_TYPE = {
     "formation": _draw_formation,
     "block": _draw_block,
@@ -249,6 +325,13 @@ _DRAW_BY_TYPE = {
     "underlap": _draw_run,
     "press": _draw_press,
     "offside_line": _draw_offside_line,
+    "marking": _draw_edge,
+    "press_engage": _draw_edge,
+    "rotation": _draw_moving_play,
+    "overlap_run": _draw_moving_play,
+    "give_and_go": _draw_moving_play,
+    "third_man_run": _draw_moving_play,
+    "pressing_trap": _draw_moving_play,
 }
 
 
@@ -381,3 +464,86 @@ if __name__ == "__main__":
         size = os.path.getsize(out_path)
         assert size > 5000, f"GIF looks too small to be real ({size} bytes)"
         print(f"OK: wrote {out_path} ({size} bytes)")
+
+    # ---------------------------------------------------------------- M6
+    # moving-geometry types: marking/press_engage (track) + rotation/
+    # overlap_run/give_and_go/third_man_run/pressing_trap (path/track),
+    # interpolated at each frame's t so lines/arrows MOVE with the players.
+    import math
+
+    def _a(t):
+        return (20.0 + 6.0 * t, 30.0)
+
+    def _b(t):
+        return (25.0 + 6.0 * t, 34.0)
+
+    ts = [f.t for f in frames]
+    t_end = ts[-1]
+    moving_detections = [
+        Detection("marking", ["H1", "A1"], {
+            "track": [(t, *_a(t), *_b(t)) for t in ts],
+        }, 0.85, 0.0, t_end),
+        Detection("press_engage", ["H2", "A1"], {
+            "track": [(t, *_b(t), *_a(t)) for t in ts],
+        }, 0.6, 0.0, t_end),
+        Detection("rotation", ["H1", "H2"], {
+            "a_path": [(t, 40 + 3 * t, 20 + 2 * t) for t in ts],
+            "b_path": [(t, 40 + 3 * t, 45 - 2 * t) for t in ts],
+            "roles": ["R3", "R4"],
+        }, 0.7, 0.0, t_end),
+        Detection("overlap_run", ["A2"], {
+            "run_path": [(t, 10 + 8 * t, 10.0) for t in ts],
+        }, 0.55, 0.0, t_end),
+        Detection("give_and_go", ["H1", "H2"], {
+            # real key from plays.py._give_and_gos: 'a_path'
+            "a_path": [(t, 60 - 4 * t, 50.0) for t in ts],
+        }, 0.5, 0.0, t_end),
+        Detection("third_man_run", ["H1", "H2", "A1"], {
+            "run_path": [(t, 70.0, 10 + 5 * t) for t in ts],
+        }, 0.45, 0.0, t_end),
+        # pressing_trap's own geometry (plays.py._pressing_traps) is just the
+        # carrier's path -- see overlay.py/primitives.py for the fuller
+        # presser-edge cross-reference this "simple version" skips.
+        Detection("pressing_trap", ["A1", "A2", "H1"], {
+            "carrier_path": [(t, 78 - 2 * t, 35.0) for t in ts],
+            "pressers": ["A2", "H1"],
+        }, 0.65, 0.0, t_end),
+    ]
+    for d in moving_detections:
+        assert _resolve_drawer(d.type) is not None, d.type
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    out_dir = os.path.join(root, "out", "m6_selfcheck")
+    os.makedirs(out_dir, exist_ok=True)
+    m6_gif = os.path.join(out_dir, "pitch_moving_selfcheck.gif")
+    render_clip(frames, moving_detections, m6_gif, fps=12.5, dpi=70)
+    assert os.path.exists(m6_gif), "M6 render_clip did not write a file"
+    m6_size = os.path.getsize(m6_gif)
+    assert m6_size > 5000, f"M6 GIF looks too small to be real ({m6_size} bytes)"
+    print(f"OK (M6 moving): wrote {m6_gif} ({m6_size} bytes)")
+
+    # 3 jpgs for eyeballing: the marking edge must visibly track the moving
+    # pair across the frames.
+    fig2, ax2 = plt.subplots(figsize=(9.0, 6.0), dpi=90)
+    marking_det = moving_detections[0]
+    saved, marking_xy = [], []
+    for idx in (0, n // 2, n - 1):
+        ax2.clear()
+        draw_pitch(ax2)
+        frame = frames[idx]
+        for d in moving_detections:
+            _resolve_drawer(d.type)(ax2, d, frame)
+        _draw_players(ax2, frame)
+        ax2.set_title(f"t={frame.t:6.2f}s", fontsize=8)
+        p = os.path.join(out_dir, f"pitch_moving_f{idx}.jpg")
+        fig2.savefig(p)
+        saved.append(p)
+        v = interp_track(marking_det.geometry["track"], frame.t)
+        marking_xy.append((v[0], v[1]))
+    plt.close(fig2)
+
+    moved = math.dist(marking_xy[0], marking_xy[-1])
+    assert moved > 5.0, f"marking edge did not move across sampled frames ({moved:.1f}m)"
+    print(f"OK (M6 moving): marking moved {moved:.1f}m across sampled frames")
+    for p in saved:
+        print("sample:", p)

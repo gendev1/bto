@@ -234,3 +234,116 @@ bridge.
 Residual known limits: cwc press/isolation/1v1 recall is zero (upstream ball/tracker quality,
 out of precision scope); Metrica 2v2 retention fails the 60% bar by construction of the ball
 gate; formation labels are tracked-subset counts, not true formations.
+
+# M6 — Relational layer: roles, edges, play grammar (2026-07-02)
+
+Replaces memoryless per-frame geometry ("dancing rectangles") with persistent,
+player-anchored structure. Three new modules plus reworked consumers, all pure
+functions over `list[Frame]`, all causal so the live host reuses them:
+
+## Architecture
+
+- **`bto/patterns/roles.py`** — `assign_roles(frames, team)` fits a 10-slot
+  formation template per team (attacking-normalized coords, per-frame rearmost
+  dropped as GK, <=5 EM rounds of per-frame Hungarian assignment + slot
+  re-estimation), then runs a CAUSAL final pass with sticky cost (holder's slot
+  discounted 5 m) and 1 s hysteresis. Role ids `R1..R10` are ordered
+  defense->attack lines (>=5 m x-gap clustering) then bottom->top y. Emits
+  `rotation` Detections (sustained >=4 s slot swaps) with moving `a_path`/`b_path`.
+- **`bto/patterns/edges.py`** — the "who covers whom" state machine.
+  `marking`: born after >=1.2 s ACCUMULATED coupled time within 6 m (blips <=0.3 s
+  pause the clock), one mark per defender / <=2 markers per attacker, survives
+  excursions to 9 m for 1.5 s and endpoint dropouts to 2 s with tid adoption
+  (same-team player <2 m within 0.5 s); `press`: within 5 m of the possession
+  carrier and closing, sustained >=0.6 s. `samples` at ~5 Hz feed the renderer.
+- **`bto/patterns/plays.py`** — grammar on top: `give_and_go`, `overlap_run`
+  (lagging-marker gate from edges), `third_man_run` (marker actually dropped:
+  growth>3 m or dissolve+growth>1.5 m), `pressing_trap` (>=3 press/marking
+  closers, no unmarked outlet), 8 s same-type+players cooldown.
+- **Moving-geometry render convention** (`overlay.py`, `pitch.py`,
+  `primitives.py`): any Detection geometry with a `track` ([(t,xa,ya,xb,yb)])
+  or `*_path` ([(t,x,y)]) is interpolated at the CURRENT frame t — lines follow
+  people instead of blinking. Edges layer capped at 4 concurrent by confidence,
+  chips only for the top 2.
+- **`run_all`** computes roles + edges ONCE and injects them into
+  detect_matchups (candidates = connected components of alive edges),
+  detect_pressing (pressers = alive press edges) and detect_plays, then appends
+  rotations + the raw marking/press layer.
+
+## Metrica numbers (Sample Game 1, t=300–600 s, 3750 frames @12.5 Hz, 5.0 min)
+
+- run_all: 1183 detections in 1.34 s. Roles: home formation 6-4, 6 rotations,
+  0.62 role-changes/player/min; away 8-2 (deep block, matches detect_formation's
+  8-1-1/8-2 on the window), 2 rotations, 0.29 — inside the 0–6 rotations /
+  <2 changes sanity bands.
+- Edges: marking 227 (45.4/min), press 18 (3.6/min); concurrent alive mean 11.1
+  max 19 (track-don't-draw band; renderer draws <=4); mean edge life 13.6 s,
+  mean strength 0.48.
+- Plays: overlap_run 1, give_and_go 0 (honest: only 2 timing-valid A-B-A triples
+  in the window, both moving backward), third_man_run 0 (10–11 fast runners/5min
+  but marker growth −2.7..1.6 m — nobody actually beat their marker), 8 rotations.
+- Eyeball (out/m6_metrica.gif, 60 s window, 4 extracted frames incl. a
+  consecutive pair at t=424.04/424.12 s): marking lines track defender–attacker
+  pairs smoothly across frames, zero flicker; press triangle and rotation paths
+  anchored to the right players.
+
+## cwc integration find: upstream tids were per-frame indices
+
+The regenerated `out/cwc2021_chelsea_palmeiras_20m/detections.jsonl` had NO
+cross-frame tracking: nearest-neighbor tid consistency 16.6 %, median per-frame
+"step" for a tid 18.5 m (implied 185 m/s) — tids were detection indices. This
+is the literal "dancing rectangles" root cause, and it starves the whole M6
+layer (0 marking edges: coupled durations topped out just under the 1.2 s gate).
+Fix: the bridge now NEVER trusts upstream tids — `bridge._retrack()` re-tracks
+every segment causally by Hungarian assignment on pitch-space proximity
+(gate 1.2 m + 9 m/s x time-unseen, coast 1.2 s, majority team tag, raw-tid
+0.5 m tiebreaker so real ByteTrack continuity still wins where present).
+After: median step 0.11–0.23 m, p99 <2.7 m; honest churn remains (median tid
+life 0.9–2.0 s, p90 6–12 s) which the edge adoption + slot-based roles absorb.
+
+## cwc numbers (4 main segments, 107.7 s, ~14.6 players/frame, 10 Hz)
+
+run_all: 317 detections (was 194 with zero relational types): marking 74
+(41/min, mean life 7.3 s on the longest segment), press_engage 1, 1v1 26,
+1v2 8, rotation 1, formation 25, block 68, offside_line 106, triangle 5,
+back_pass 3. Press ~0 is the known phantom-ball recall limit (unchanged).
+
+## Overlay eyeball verdicts (m4_overlay.mp4 regenerated, 8 frames)
+
+- Consecutive pairs t=25.0/25.1 s and t=150.0/150.1 s: MARK lines anchored to
+  real defender–attacker pairs (Chelsea blue on Palmeiras white) and move WITH
+  them between frames; chips stable, no blinking. PASS.
+- t=40 s (transition): offside line only, no spurious boxes. t=125 s, t=175 s:
+  marking edges on plausible pairs. PASS.
+- t=70 s (crowd shot): "[overlay off]", replays stay blank. PASS.
+- Old 1-frame matchup flicker: gone — matchups now require a matured edge
+  component (>=1.2 s evidence) plus their own min-duration. PASS.
+
+## Live path (M1 8GB, MPS)
+
+40-frame `bto.host.stream` self-check: patterns stage 1.4 ms/frame (detect
+383.8, calib 65.1, total 455.2 ms/frame, 2.19 proc fps — detect still dominates).
+Full run_all on a worst-case 15 s/188-frame/22-player buffer is 54.7 ms, over
+the 30 ms budget, so `StreamPipeline` amortizes: full relational recompute every
+`relational_every=5` pattern ticks, cheap detectors (formation/block/offside/
+back_pass/isolation, ~4 ms) every tick, relational Detections reused in between
+(their (t,...) tracks keep interpolating). Measured amortized: 13.5 ms/frame.
+
+## Honest gaps
+
+- **Re-ID is proximity-only.** The bridge retracker has no appearance model:
+  crossing players can swap identities, and a 1.2 s dropout kills a track. tid
+  churn on cwc is still median ~1–2 s. Jersey-number OCR (or torso-embedding
+  re-ID) is the real fix and would also let roles survive substitutions.
+- **Upstream tracking should be re-run.** detections.jsonl deserves a proper
+  ByteTrack regeneration; the bridge fix makes downstream robust to broken ids
+  but good upstream ids would raise edge lifetimes further.
+- **Press recall on cwc ~0** — phantom/absent ball (33 % coverage gaps) starves
+  possession(); press edges need a trusted carrier. Better ball detection first.
+- **Rotations on broadcast are rare-by-construction**: 4 s sustained swaps need
+  4 s of joint visibility, which broadcast pans rarely give (1 in 107.7 s).
+- **pressing_trap / give_and_go / third_man_run did not fire on cwc** —
+  windows are short and churned; validated on Metrica + synthetic only.
+- detect_pressing's >=2-concurrent-pressers gate on top of edges' 0.6 s
+  sustained-closing birth drops Metrica press episodes 14 -> 1 per 5 min
+  (edges themselves found 18); worth revisiting the concurrency floor.

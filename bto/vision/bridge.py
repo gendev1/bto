@@ -23,9 +23,11 @@ Rules (frozen M3 interchange):
 """
 
 import json
-from collections import deque
+from collections import Counter, deque
 from math import hypot
 from statistics import median
+
+from scipy.optimize import linear_sum_assignment
 
 from bto.core import AWAY, HOME, Frame, PlayerPos
 
@@ -49,6 +51,21 @@ BALL_COAST_MAX_S = 0.5
 PLAYER_TELEPORT_SPEED = 12.0  # m/s: faster than any player => track break
 BALL_TELEPORT_SPEED = 40.0    # m/s: faster than any kick => mistrack
 BALL_REACQUIRE_S = 0.5        # s: after this long, trust the new ball point
+# Bridge-side re-tracking (M6 integration pass). The M6 relational layer
+# (marking/press edges, roles, plays) needs identities that persist across
+# frames; the upstream perception tids turned out to be per-frame detection
+# indices on the cwc clip (nearest-neighbor tid consistency 16.6% -- i.e. no
+# cross-frame tracking at all), which is exactly the "dancing rectangles"
+# failure. The bridge therefore never trusts upstream tids directly: every
+# segment is re-tracked CAUSALLY by Hungarian assignment on pitch-space
+# proximity (scipy linear_sum_assignment, already a dep), with the raw tid
+# only used as a small cost tiebreaker so genuinely good upstream tracking
+# (ByteTrack) is preserved where it exists.
+RETRACK_GATE_BASE = 1.2   # m: base match gate at dt -> 0
+RETRACK_GATE_SPEED = 9.0  # m/s: gate grows this fast with time-unseen
+RETRACK_DROP_S = 1.2      # s: unseen this long -> track retired
+RETRACK_TAG_PENALTY = 3.0  # m: cost penalty when team tags disagree
+RETRACK_TID_BONUS = 0.5    # m: cost discount when the raw tid matches
 
 
 def _read_jsonl(path):
@@ -108,6 +125,64 @@ def _project_row(row, h, ball_by_idx, ball_trusted=None):
         if pt is not None and _in_bounds(pt):
             ball_m = (pt[0], pt[1])
     return row["t"], players, ball_m
+
+
+def _retrack(raw):
+    """Causal identity re-assignment over one raw segment (M6 pass).
+
+    raw rows are (t, players, ball) with players [(tid, tag, x, y)] in
+    METERS. Emits the same shape but with stable ids: per frame, live
+    tracks are matched to detections by Hungarian assignment on euclidean
+    distance, gated at RETRACK_GATE_BASE + RETRACK_GATE_SPEED * time-unseen
+    (a track coasts at its last position up to RETRACK_DROP_S). A team-tag
+    disagreement costs RETRACK_TAG_PENALTY (team labels may flicker
+    per-detection); a matching upstream tid earns RETRACK_TID_BONUS so real
+    ByteTrack continuity, where present, breaks ties. Unmatched detections
+    open new tracks (ids numbered in first-seen order, starting at 1); the
+    emitted tag is the track's MAJORITY tag over its life so far, keeping
+    'gk' folding and team splits stable. Purely causal: frame i only sees
+    tracks built from frames <= i.
+    """
+    tracks: dict = {}  # id -> [x, y, last_t, last_raw_tid, Counter(tags)]
+    next_id = 1
+    out = []
+    for t, players, ball in raw:
+        live = [
+            (tid, st) for tid, st in tracks.items() if t - st[2] <= RETRACK_DROP_S
+        ]
+        n_tr, n_det = len(live), len(players)
+        assigned = {}
+        if n_tr and n_det:
+            big = 1e6
+            cost = [[big] * n_det for _ in range(n_tr)]
+            for r, (_tid, st) in enumerate(live):
+                gate = RETRACK_GATE_BASE + RETRACK_GATE_SPEED * (t - st[2])
+                for c, (raw_tid, tag, x, y) in enumerate(players):
+                    d = hypot(x - st[0], y - st[1])
+                    if d > gate:
+                        continue
+                    if tag != st[4].most_common(1)[0][0]:
+                        d += RETRACK_TAG_PENALTY
+                    if raw_tid == st[3]:
+                        d -= RETRACK_TID_BONUS
+                    cost[r][c] = d
+            rows, cols = linear_sum_assignment(cost)
+            for r, c in zip(rows, cols):
+                if cost[r][c] < big:
+                    assigned[c] = live[r][0]
+        emitted = []
+        for c, (raw_tid, tag, x, y) in enumerate(players):
+            tid = assigned.get(c)
+            if tid is None:
+                tid = next_id
+                next_id += 1
+                tracks[tid] = [x, y, t, raw_tid, Counter()]
+            st = tracks[tid]
+            st[0], st[1], st[2], st[3] = x, y, t, raw_tid
+            st[4][tag] += 1
+            emitted.append((tid, st[4].most_common(1)[0][0], x, y))
+        out.append((t, emitted, ball))
+    return out
 
 
 def _smooth_raw(raw):
@@ -267,7 +342,7 @@ def build_frames(perception_jsonl, calib_jsonl, ball_jsonl=None):
     for raw in segments_raw:
         if raw[-1][0] - raw[0][0] < MIN_SEGMENT_S:
             continue
-        segments.append(_finalize(_smooth_raw(raw)))
+        segments.append(_finalize(_smooth_raw(_retrack(raw))))
     return segments
 
 
