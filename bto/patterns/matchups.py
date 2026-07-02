@@ -215,8 +215,14 @@ def detect_isolations(
         pair = None
         geometry = None
         confidence = None
+        # the spell's original tid can be absent from a frame (tid swap
+        # mid-spell, or occlusion during a bridged ball gap) -> skip frame
+        carrier = None
         if carrier_id is not None:
-            carrier = next(p for p in frame.players if p.track_id == carrier_id)
+            carrier = next(
+                (p for p in frame.players if p.track_id == carrier_id), None
+            )
+        if carrier is not None:
             defenders = frame.team_players(other(carrier_team))
             if defenders:
                 defender = min(

@@ -67,3 +67,41 @@ def test_no_ball_produces_no_spells():
     fillers = [PlayerPos("H1", HOME, 50.0, 34.0), PlayerPos("A1", AWAY, 55.0, 34.0)]
     frames = [make_frame(k * DT, fillers, None) for k in range(20)]
     assert possession(frames) == []
+
+
+def test_tid_swap_mid_possession_does_not_split_spell():
+    # ByteTrack identity swap: the holder's track_id flips A -> A2 at frame 10
+    # while the player (same team) stays on the ball at the same spot. Must be
+    # ONE spell keeping the ORIGINAL track_id.
+    frames = []
+    for k in range(20):
+        tid = "A" if k < 10 else "A2"
+        players = [PlayerPos(tid, HOME, 30.0, 34.0), PlayerPos("A1", AWAY, 90.0, 34.0)]
+        frames.append(make_frame(k * DT, players, (30.0, 34.0)))
+
+    spells = possession(frames)
+
+    assert len(spells) == 1
+    assert spells[0].track_id == "A"
+    assert spells[0].team == HOME
+    assert spells[0].i_start == 0
+    assert spells[0].i_end == 19
+
+
+def test_real_pass_to_teammate_6m_away_splits_spell():
+    # Genuine pass: ball leaves A's control (> handoff_dist from A's last
+    # position) and teammate B, 6m away, controls it -> TWO spells.
+    a = PlayerPos("A", HOME, 30.0, 34.0)
+    b = PlayerPos("B", HOME, 36.0, 34.0)
+    frames = []
+    for k in range(10):
+        frames.append(make_frame(k * DT, [a, b], (30.0, 34.0)))
+    # in flight: 3m from both, outside control_radius -> no candidate
+    frames.append(make_frame(10 * DT, [a, b], (33.0, 34.0)))
+    for k in range(11, 21):
+        frames.append(make_frame(k * DT, [a, b], (36.0, 34.0)))
+
+    spells = possession(frames)
+
+    assert [s.track_id for s in spells] == ["A", "B"]
+    assert spells[0].i_end < spells[1].i_start

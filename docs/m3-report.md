@@ -58,3 +58,47 @@ Result: per-frame team split home 104 / away 105 / ref 9; annotated video and 2D
 - `out/<stem>/calib.jsonl`, `calib_report.json`, `calib_viz/*.jpg` (both clips)
 - `out/<stem>/m3_detections.json`, `m3_pitch.gif` (both clips)
 - `out/cwc2021_chelsea_palmeiras_20m/{teams.json,teams_frames.jsonl,perception.jsonl,m2_annotated.mp4}` regenerated with the team fix
+
+---
+
+# M4 — Overlay compositing + possession/calib fixes
+
+Date: 2026-07-02. New module: `bto/render/overlay.py` + `scripts/run_m4.py` (SPEC C7: all geometry in pitch meters, projected to px via inv(H) per frame, alpha-composited on the original video; shot classifier blanks replays). Acceptance artifact: `out/<stem>/m4_overlay.mp4` (both clips).
+
+## What changed
+
+1. **Possession robustness** (`bto/patterns/possession.py`, M3 top issue #1/#2): a nearest-in-radius candidate now CONTINUES a spell if it is the same tid OR the same team within `handoff_dist=2.0` m of the holder's last known position (original spell tid kept, position tracked per frame); an opponent or a >2 m teammate still splits. Kills the "same tid for 3 consecutive frames" starvation caused by ByteTrack id swaps. Tests 17 -> 19 (tid-swap does not split; 6 m teammate pass splits). `tests/__init__.py` added: ultralytics 8.4.84 ships a top-level `tests` package that shadowed the local namespace tests dir and broke pytest collection.
+2. **Calib pan lag + reseed jumps** (`bto/vision/calib.py`, M3 top issues #3/#4): (a) adaptive EMA alpha — ramps 0.5 -> 0.9 when the raw-fit anchor residual is > 0.5 m in a consistent direction for 2 consecutive frames (a pan, not noise); (b) reseed interpolation — a fresh fit landing > 5 m from the last held anchors only moves 40% of the way on the reseed frame, the adaptive alpha pulls in the rest over the next 1–2 frames.
+3. **Run-path teleport gate** (`bto/patterns/runs.py`, found during M4 eyeball): with possession spells restored on cwc, overlap/underlap fired 28 times but EVERY path had physically impossible raw steps (18.7–56.7 m in ~0.2 s = tid teleports), drawn as full-pitch zigzag storms in the overlay. Added `_MAX_SPEED=12` m/s raw-step gate in `_check_window`; all 28 rejected (honest 0 — real overlaps are rare in 108 s of churny tracking). Bundesliga unaffected (had 0).
+4. **Guard fix** (`bto/patterns/matchups.py` `detect_isolations`): unguarded `next()` raised StopIteration when a spell's original tid is absent from a covered frame (tid swap mid-spell); now `next((...), None)` + skip, matching every other Spell consumer.
+
+## cwc numbers (regenerated calib, stride 3, shots-gated, 1141 main frames @ 6.4 fps MPS)
+
+| metric | old (M3) | new (M4) |
+|---|---|---|
+| valid-H fraction | 99.2% (1132/1141) | 99.2% (1132/1141), src fit=60 ema=870 held=202 null=9 |
+| rmse_m fit median / p90 | 0.348 / 0.598 | 0.465 / 0.647 (100% under the 1.5 m SPEC target) |
+| temporal stability median / mean / max | 0.111 / 0.461 / **49.92 m** | 0.108 / 0.367 / **21.35 m** (worst reseed jump −57%; all top-10 deltas sit at the frame-5049 reseed, now interpolated) |
+| possession spells | 3 in 107.7 s | **33** (18.4/min); bundesliga 11 -> 11 |
+| detections total | 357 | **502** |
+| ball-dependent | **0** | back_pass 18, isolation 37, press 89 (+ offside 198, block 112, formation 48) |
+| tracker churn | 23.3 new-tids/min | unchanged (tracker untouched) |
+
+Bundesliga regression: 140 -> 136 detections (back_pass 7->6, triangle 4->3, isolation 7->5 — nearby-teammate spells that used to split now merge); all 12 types still fire. pytest 19 passed.
+
+Bands vs expectation: back_pass 18/107.7 s (~10/min) is still hot (M3 issue #5, possession-churn noise now on more spells) and triangle is still 0 (clear-lane + 1 s same-trio starved by teammate tid churn) — both are tracker-identity problems, not detector bugs; deferred to M5.
+
+Calib wireframe eyeball (8 frames): 5 GOOD / 3 FAIR — the same three mid-pan frames as M3 (495/3771/4422, center circle 1–3 m off, lines/boxes still track). H at the sampled frames moved <= 0.07 m vs the old calib, so verdicts are unchanged: the reseed fix is large and real, the pan-lag fix is modest (median center-disp −17–23% in the pan windows).
+
+## Overlay eyeball verdicts (m4_overlay.mp4, 8 sampled frames per clip)
+
+- **bundesliga** (375 frames @ 12.5 fps, drawable 375/375, 38.9 MB): 8/8 GOOD. f0 fade-in from banner-only; f106 hulls hug both blocks, 2v1/1v2 boxes + dashed pair links land on real players, PRESS ring on the carrier; f214 BACK PASS arrow tip touches the receiving white player, ISO spotlights hug the duel; f428/f534/f642 triangles/1v2/ISO on real players, offside dashed lines perspective-correct on both halves; f748 end-of-clip fade-out. Note: the black box top-right is baked into the source (scoreboard blackout), and formation label chips occasionally show data-side noise (e.g. "AWAY 8-3").
+- **cwc** (1809 frames @ 10 fps, drawable 1132/1809 = the valid-H main frames, 101 MB; final draw counts formation=2162, offside=2115, events=360 [back_pass 171, press 151, isolation 38]): first render exposed the overlap/underlap zigzag storm (fix #3 above); after the gate, re-rendered clean (re-eyeballed the same frames). f300 BACK PASS arrow + hull GOOD; f900/f1500/f3900 hulls + both offside lines GOOD; f1656 (last main frame before the replay wipe, mislabeled main by the shot classifier) draws banner-only — the drawable-run fade already suppressed overlays, no flicker at the cut; f1662/f5100 (shot=other) show "[overlay off]" banner and NOTHING drawn on the replay wipe/close-ups; f2718 (first main after a replay) correctly blank-then-fade-in. Formation chip shows data-side label noise ("HOME 15-1") — renderer is faithful to m3_detections.
+
+## Top issues for M5 (near-live)
+
+1. **Tracker identity swaps** remain the single root cause: triangle starvation, back_pass over-firing, and every overlap/underlap being a teleport all trace to tid churn inside main segments. Kit-color gate in the ByteTrack association cost is the highest-leverage fix.
+2. **Throughput**: calib 6.4 fps + detect ~6 fps on MPS is ~2.5x too slow for near-live at stride 3. Calib only needs a FIT every N frames — interpolate H (anchor-space lerp) between fits; batch the detector; consider 480p detect with 720p ball crop.
+3. **Interpolation/latency**: the pipeline is batch (jsonl interchange). Near-live needs a streaming loop with bounded lag — the EMA/hold logic already works causally; the bridge and pattern engine need incremental variants (possession/formation are already windowed).
+4. **Ball tracking**: 74% coverage on main segments, jitter breaks spells — Kalman bridging + crop-path upgrade.
+5. **Pan lag residual**: center circle still 1–3 m off mid-pan (FAIR frames); velocity-aware prediction (extrapolate anchor motion) instead of pure EMA.

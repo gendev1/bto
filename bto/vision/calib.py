@@ -16,8 +16,8 @@ src semantics:
     "held" - no accepted fit this frame; H is the last good (EMA) H held for up
              to HOLD_MAX_S seconds, or null once the hold expires.
 
-Drift mitigations (SPEC S9), all three:
-    (a) EMA smoothing of H across consecutive frames (alpha=0.5), reset at shot
+Drift mitigations (SPEC S9), all three, plus an M4 pan-lag tune (d):
+    (a) EMA smoothing of H across consecutive frames, reset at shot
         boundaries. Smoothing happens in ACTION space, not matrix space: we EMA
         the meter-projections of 4 fixed pixel anchor points and refit H exactly
         through them (cv2.getPerspectiveTransform), because elementwise mixing
@@ -27,6 +27,17 @@ Drift mitigations (SPEC S9), all three:
         bundesliga_smoke frames 40/42: parents agree to <= 6.6 m at the anchors
         but their elementwise 50/50 blend lands 9-20 m away from BOTH parents).
         Anchor-space EMA is exact linear interpolation of the mapping.
+        Alpha is ADAPTIVE (docs/m3-report.md "Calib EMA lag on pans"): a fixed
+        alpha=0.5 tracks noise well but lags a fast camera pan by 1-3 m
+        (measured on cwc2021 wireframe eyeball grading: center circle drawn
+        1-3 m off mid-pan). Each frame with an accepted fit we look at the
+        residual between the raw fit's anchors and the current EMA anchor: if
+        that residual is large (per-anchor mean > PAN_DISP_M) AND points the
+        same direction (cosine > PAN_COS_MIN) as the PREVIOUS frame's residual
+        -- i.e. the EMA is being pulled the same way two frames running, a
+        pan, not single-frame noise -- alpha ramps to PAN_ALPHA (~0.9) so the
+        EMA catches up within ~2 frames; otherwise alpha stays at EMA_ALPHA
+        (~0.5) for noise smoothing.
     (b) hold last good H up to 2 s when a frame yields no valid fit, else null;
     (c) sanity gate: each new fit must not move any anchor projection by > 8 m
         relative to the current smoothed state (else treated as no-fit -> hold
@@ -36,6 +47,16 @@ Drift mitigations (SPEC S9), all three:
         the frame rather than the true frame corners: the top corners of a
         broadcast frame sit near or above the pitch plane's vanishing line,
         where a px->m homography is numerically explosive.
+    (d) re-seed interpolation: a hold-expiry or gate-outvote reseed used to
+        hard-jump the EMA straight onto the fresh fit's anchors, producing up
+        to ~50 m single-frame jumps in the temporal-stability metric whenever
+        the last held H and the fresh fit disagree (measured on cwc2021:
+        held->fit transitions after shot cuts). Now, if the fresh fit
+        disagrees with the LAST HELD anchor position by > RESEED_INTERP_M, the
+        reseed frame (still emitted as src="fit", per the interchange
+        contract) only moves RESEED_INTERP_ALPHA of the way there, primed with
+        an elevated pan streak so the next 1-2 "ema" frames (via the adaptive
+        alpha in (a)) finish closing the gap instead of a hard cut.
 """
 
 from __future__ import annotations
@@ -52,9 +73,14 @@ import torch
 
 DEFAULT_MODEL = "models/football-pitch-detection.pt"
 
-EMA_ALPHA = 0.5
+EMA_ALPHA = 0.5          # base/noise alpha: small or inconsistent residuals
+PAN_ALPHA = 0.9          # elevated alpha once a pan is detected (see (a) above)
+PAN_DISP_M = 0.5         # per-anchor mean residual [m] above which a step is "large"
+PAN_COS_MIN = 0.3        # min cosine similarity between consecutive residuals to call them "consistent"
 HOLD_MAX_S = 2.0
 GATE_TOL_M = 8.0
+RESEED_INTERP_M = 5.0    # anchor disagreement [m] above which a reseed interpolates instead of jumping
+RESEED_INTERP_ALPHA = 0.4  # fraction of the gap the reseed frame itself closes
 RANSAC_THRESH_M = 1.5  # findHomography threshold applies in TARGET units = meters
 
 
@@ -133,6 +159,20 @@ def _anchor_px(w: int, h: int) -> np.ndarray:
 def _anchors_close(a: np.ndarray, b: np.ndarray) -> bool:
     d = np.sqrt(((a - b) ** 2).sum(axis=1))
     return bool(np.all(np.isfinite(d)) and float(d.max()) <= GATE_TOL_M)
+
+
+def _residual(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, float]:
+    """(mean direction vector [m], per-anchor mean magnitude [m]) of a - b."""
+    d = a - b
+    mag = float(np.sqrt((d ** 2).sum(axis=1)).mean())
+    return d.mean(axis=0), mag
+
+
+def _cos_sim(u: np.ndarray, v: np.ndarray) -> float:
+    nu, nv = float(np.linalg.norm(u)), float(np.linalg.norm(v))
+    if nu < 1e-9 or nv < 1e-9:
+        return 0.0
+    return float(np.dot(u, v) / (nu * nv))
 
 
 def _h_from_anchors(anchor_px: np.ndarray, anchor_m: np.ndarray) -> np.ndarray:
@@ -222,6 +262,15 @@ def calibrate(
     ema_h: np.ndarray | None = None       # H through the smoothed anchors (last good H)
     rej_anchor: np.ndarray | None = None  # anchors of the last gate-rejected fit
     last_good_t: float | None = None
+    # (d) last known-good anchor position, kept across hold/expiry/reseed so a
+    # fresh fit can be compared against where the EMA actually last was (not
+    # just whether ema_anchor happens to be non-None right now).
+    last_held_anchor: np.ndarray | None = None
+    # (a) pan-detection state: previous frame's fit-vs-ema residual + streak
+    # of consecutive large-and-consistent residuals.
+    prev_resid: np.ndarray | None = None
+    prev_resid_mag: float = 0.0
+    pan_streak = 0
     prev_main_idx: int | None = None
     frame_idx = 0
     n_written = 0
@@ -245,6 +294,8 @@ def calibrate(
                 if prev_main_idx is not None and frame_idx - prev_main_idx != stride:
                     ema_anchor = ema_h = rej_anchor = None
                     last_good_t = None
+                    last_held_anchor = None
+                    prev_resid, prev_resid_mag, pan_streak = None, 0.0, 0
                 prev_main_idx = frame_idx
 
                 t_frame = time.time()
@@ -270,14 +321,36 @@ def calibrate(
 
                 if H_fit is not None:
                     if ema_anchor is None:
-                        ema_anchor, ema_h, src = fit_anchor, H_fit, "fit"
+                        # (d) reseed: jump straight in if there's no prior
+                        # anchor to compare to, or the disagreement is small;
+                        # otherwise interpolate part-way and prime the pan
+                        # streak so the following ema frames close the rest.
+                        if last_held_anchor is not None:
+                            resid0, jump_mag = _residual(fit_anchor, last_held_anchor)
+                        else:
+                            resid0, jump_mag = None, 0.0
+                        if resid0 is not None and jump_mag > RESEED_INTERP_M:
+                            ema_anchor = (RESEED_INTERP_ALPHA * fit_anchor
+                                          + (1.0 - RESEED_INTERP_ALPHA) * last_held_anchor)
+                            prev_resid, prev_resid_mag, pan_streak = resid0, jump_mag, 1
+                        else:
+                            ema_anchor = fit_anchor
+                            prev_resid, prev_resid_mag, pan_streak = None, 0.0, 0
+                        ema_h, src = _h_from_anchors(a_px, ema_anchor), "fit"
                     else:  # (a) EMA in anchor (action) space, see module doc
-                        ema_anchor = (EMA_ALPHA * fit_anchor
-                                      + (1.0 - EMA_ALPHA) * ema_anchor)
+                        resid, mag = _residual(fit_anchor, ema_anchor)
+                        consistent = (prev_resid is not None
+                                      and mag > PAN_DISP_M and prev_resid_mag > PAN_DISP_M
+                                      and _cos_sim(resid, prev_resid) > PAN_COS_MIN)
+                        pan_streak = pan_streak + 1 if consistent else int(mag > PAN_DISP_M)
+                        alpha = PAN_ALPHA if pan_streak >= 2 else EMA_ALPHA
+                        ema_anchor = alpha * fit_anchor + (1.0 - alpha) * ema_anchor
                         ema_h = _h_from_anchors(a_px, ema_anchor)
+                        prev_resid, prev_resid_mag = resid, mag
                         src = "ema"
                     last_good_t = t
                     rej_anchor = None
+                    last_held_anchor = ema_anchor
                     H_out, rmse_out = ema_h, rmse
                 else:
                     # (b) hold last good H for up to HOLD_MAX_S, else null
@@ -288,6 +361,8 @@ def calibrate(
                     else:
                         H_out = ema_anchor = ema_h = None
                         last_good_t = None
+                        # last_held_anchor deliberately NOT cleared here: it
+                        # is the reseed's comparison point in (d) above.
 
                 rec = {
                     "frame_idx": frame_idx,

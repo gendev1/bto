@@ -15,6 +15,8 @@ from bto.core import Detection, Frame, PITCH_WIDTH
 from bto.patterns.possession import possession
 
 _LEVEL_EPS = 0.5  # meters: "behind or level" tolerance along attacking axis
+_MAX_SPEED = 12.0  # m/s: above elite sprint (~10.5); faster raw steps are
+                   # tracker identity swaps (teleports), not a human run
 
 
 def _infer_dt(frames: list[Frame]) -> float:
@@ -64,6 +66,18 @@ def _check_window(
     c_end = _pos(frames[j], c_id)
     if c_start is None or c_end is None:
         return None
+
+    # reject windows where R's RAW step speed is physically impossible --
+    # ByteTrack tid swaps teleport the track between players, which smoothing
+    # and the avg-speed gate below cannot distinguish from a genuine sprint.
+    for k in range(1, len(r_raw)):
+        dt_k = frames[i + k].t - frames[i + k - 1].t
+        if dt_k <= 0:
+            continue
+        dx = r_raw[k][0] - r_raw[k - 1][0]
+        dy = r_raw[k][1] - r_raw[k - 1][1]
+        if (dx * dx + dy * dy) ** 0.5 / dt_k > _MAX_SPEED:
+            return None
 
     direction = frames[i].attacking.get(team, 1)
 
