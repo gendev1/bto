@@ -8,3 +8,6 @@ out/
 .pytest_cache/
 *.egg-info/
 models/
+
+# M5: demo clip served at /clip.mp4 stays local (also covered by *.mp4)
+extension/demo/clip.mp4

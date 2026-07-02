@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BTO Telestrator — no-install demo</title>
+<link rel="stylesheet" href="/style.css" />
+<style>
+  body {
+    margin: 0;
+    padding: 24px;
+    background: #111318;
+    color: #e8e8ec;
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 {
+    font-size: 18px;
+    margin: 0 0 4px;
+  }
+  .sub {
+    color: #9a9aa5;
+    margin: 0 0 20px;
+  }
+  .video-wrap {
+    max-width: 960px;
+    margin: 0 auto;
+  }
+  video {
+    display: block;
+    width: 100%;
+    background: #000;
+  }
+  .note {
+    max-width: 960px;
+    margin: 20px auto 0;
+    padding: 14px 16px;
+    background: #1b1e27;
+    border: 1px solid #2a2e3a;
+    border-radius: 8px;
+    font-size: 13.5px;
+  }
+  .note code {
+    background: #262b38;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 12.5px;
+  }
+  .note ol {
+    margin: 8px 0 0;
+    padding-left: 20px;
+  }
+  .note li {
+    margin: 4px 0;
+  }
+</style>
+</head>
+<body>
+  <div class="video-wrap">
+    <h1>BTO Telestrator — no-install demo</h1>
+    <p class="sub">
+      This page loads the same capture.js / draw.js / content.js the Chrome
+      extension uses, as plain &lt;script&gt; tags — no install required.
+    </p>
+    <video id="demo-video" controls playsinline src="/clip.mp4"></video>
+
+    <div class="note">
+      <strong>How this works</strong>
+      <ol>
+        <li>Start the local inference host: <code>uv run python -m bto.host.server</code> (listens on <code>ws://127.0.0.1:8517/stream</code>, and serves this page at <code>/</code>).</li>
+        <li>Play the video above. content.js finds it automatically, overlays a transparent canvas, and starts streaming downscaled JPEG frames to the host over WebSocket.</li>
+        <li>Tactical geometry (formation shape, matchups, offside line, back-pass / press callouts, etc.) streams back and is drawn on the canvas in real time.</li>
+        <li>Watch the status badge in the corner of the video: <em>connecting</em> → <em>live</em>. It reads <em>overlay off</em> if no reply has arrived for 2s, and <em>DRM protected</em> if the video can't be read from canvas (see SPEC S4.1 — the extension only works on non-DRM sources).</li>
+        <li>Overlays hide automatically in fullscreen (v1 non-fullscreen scope per SPEC).</li>
+      </ol>
+      <p style="margin:10px 0 0;color:#9a9aa5;">
+        Drop your own clip at <code>extension/demo/clip.mp4</code> (server mounts this directory at <code>/</code>), or point <code>src</code> at any same-origin, non-DRM video.
+      </p>
+    </div>
+  </div>
+
+  <script src="/capture.js"></script>
+  <script src="/draw.js"></script>
+  <script src="/content.js"></script>
+</body>
+</html>

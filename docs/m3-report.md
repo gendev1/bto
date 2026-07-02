@@ -102,3 +102,56 @@ Calib wireframe eyeball (8 frames): 5 GOOD / 3 FAIR — the same three mid-pan f
 3. **Interpolation/latency**: the pipeline is batch (jsonl interchange). Near-live needs a streaming loop with bounded lag — the EMA/hold logic already works causally; the bridge and pattern engine need incremental variants (possession/formation are already windowed).
 4. **Ball tracking**: 74% coverage on main segments, jitter breaks spells — Kalman bridging + crop-path upgrade.
 5. **Pan lag residual**: center circle still 1–3 m off mid-pan (FAIR frames); velocity-aware prediction (extrapolate anchor motion) instead of pure EMA.
+
+---
+
+# M5 — Near-live: local inference host + Chrome extension (SPEC C8/C10, S4.1, S7)
+
+Date: 2026-07-02. New package `bto/host/` (three sibling-built modules integrated here) + `extension/` (MV3) + `extension/demo/` (no-install demo page). Acceptance artifact: `out/cwc2021_chelsea_palmeiras_20m/m5_preview.mp4` (what the extension user sees at reply keyframes, pre-interpolation).
+
+## Architecture
+
+- **`bto/host/stream.py` — `StreamPipeline`**: incremental port of the M2–M4 batch pipeline. Per frame: shot gate (CPU, ~3 ms; `other` frames return immediately, no GPU) -> detect+track (player model, imgsz 960, ball = class 0 + Kalman) -> calibration (full keypoint fit every `calib_every=4` main frames, EMA/gate/hold/reseed state machine ported from `calib.calibrate()`, held H in between) -> live team k-means (80-crop warmup) -> causal px->Frame bridge -> `bto.patterns.run_all` over a rolling 15 s buffer every processed main frame. Shot cuts arm a full segment reset (fresh tracker ids, calib, ball KF, buffer) — same semantics as the offline shot-gated M2 path.
+- **`bto/host/primitives.py`**: `Detection` -> frozen-protocol PRIM dicts (polygon/polyline/circle/arrow/label/chip in *sent-frame pixel space*), reusing `overlay.py`'s `project()`/`sample_polyline_m()`/colors; `prims_render_debug()` is the cv2 renderer used for the preview video.
+- **`bto/host/server.py`**: FastAPI + WS on `ws://127.0.0.1:8517/stream` (frozen protocol: 12-byte `<Id` header + JPEG in, JSON geometry out), `/health`, static mount of `extension/demo/` at `/`. Drops stale frames if a client doesn't throttle; one active stream per process; models lazy-load on first stream connect.
+- **`extension/`**: MV3 content script finds the largest `<video>`, streams ~960px JPEG q=0.7 frames self-clocked (next send only after previous reply), draws replies on an overlaid canvas with per-gid interpolation/extrapolation between the last two replies (client stays smooth at 60 Hz rAF while the host replies at ~2.6 Hz), 2 s staleness blank, DRM detection, fullscreen hide. `extension/demo/index.html` loads the same three JS files against `/clip.mp4` with zero install.
+
+## Integration fixes (found by streaming 90 s at real-time pacing, t=35–125 s of cwc, incl. the 55.3–90.5 s replay)
+
+1. **Overlay strobed at 1/3 cadence, hulls at alpha 0.024** (`primitives.py`): `detections_to_prims` re-filtered strictly on `t_start <= t <= t_end`, discarding the pipeline's deliberately grace-extended cached detections, and `_fade_alpha` faded against raw `t_end` — a *live* detection always has `t ~= t_end`, so everything sat at the 0.2 alpha floor. Fixed: activity window and fade now honor `DET_GRACE_S=0.75` (matches `StreamPipeline.det_grace_s`).
+2. **Stacked "generations" of always-on layers** (`primitives.py`): live cache + grace kept old and new windows of the same layer active at once -> up to 4 offside lines + 4 hulls per frame. Fixed: formation keeps only dets tied for max `t_end` (cap 2), offside deduped per defending team.
+3. **Stale geometry between pattern runs** (`stream.py`): `patterns_every` 3 -> 1. `run_all` on a full 15 s buffer costs ~0.4 ms/frame — running it every processed main frame keeps geometry fresh instead of up to ~1.2 s stale.
+4. **Periodic null-H flashes** (`stream.py`): fit cadence 5 frames x ~0.4 s live gap ≈ `HOLD_MAX_S` (2.0 s), so a single failed keypoint fit landed exactly at hold expiry -> one-frame overlay blackout every ~2 s on hard stretches. Fixed: `calib_every` 5 -> 4 and a failed fit retries the NEXT frame instead of waiting another cycle. Nulls on main frames: 9/75 -> 3/55 (remaining ones are the cold-start frame and a 1.2 s main sliver at a shot cut; all recover on the next frame).
+5. **`GET /` was 404**: demo page was `player.html` but Starlette's `StaticFiles(html=True)` serves `index.html`; added `extension/demo/index.html` (identical copy). Also cut a 60 s demo clip to `extension/demo/clip.mp4` (gitignored) since the page's `<video src="/clip.mp4">` expects it.
+
+`uv run pytest -q`: 19 passed throughout.
+
+## Measured (90 s real-time stream, M1 8GB MPS, imgsz 960, self-clocked client, send-latest-drop-stale)
+
+| metric | measured | S7-adjusted target (M1 8GB) | verdict |
+|---|---|---|---|
+| host proc fps on main-camera segments | **2.3–2.8 (median run 2.6)** | >= 3 | **just under** — detect is 80% of budget |
+| `proc_ms` main frames (excl. cold start) | median **362**, p90 513, max 1243 | — | detect ~300–500, calib ~60–100 amortized (fit ~245 every 4th), shot 4, teams 2, bridge+patterns <1 |
+| `proc_ms` `other` frames | median **3** (replies at full video rate) | — | shot gate pays for itself |
+| end-to-end latency (send -> reply) | median **369 ms**, p90 541 ms | <= 2 s | **PASS** (only the cold-start frame violates: 2.7–8.1 s lazy model load + MPS warmup) |
+| overlay staleness (video playhead - reply t) | median **393 ms**, p90 580 ms | <= 2 s | **PASS**; client interpolation covers the 2.6 Hz keyframe gap |
+| replay behavior | 1777 `shot=other` replies, **0** with geometry; tracker fully reset on resume (fresh tids, n_tracks 7->18 within 3 frames at t=117) | blank on replays | **PASS** |
+| frames dropped host-side | 0 (client throttles per protocol) | — | drop path exists, exercised in server self-check |
+| 15 FPS full-inference (SPEC S7 original) | not attempted | RTX-3060 target | **not reachable on M1 8GB with v8x models — by design** |
+
+Honest gap: **no event callouts (press/back-pass/isolation) fired in the live window** — at ~2.6 fps sampling the possession spells that gate every ball-dependent detector rarely survive, and class-0 ball recall at imgsz 960 is thin. Live overlay today = formation hulls + chips + offside lines (+ blocks computed but not rendered, same as M4). The offline 20-min run still fires all types; this is a live-cadence starvation, not a detector regression.
+
+Preview eyeball (6 frames from the actual WS replies): hulls/lines land on the pitch with correct perspective on the FIFA+ letterboxed source, exactly 2 offside lines + 2 hulls max after the dedupe fix, replay frames blank, post-replay resume re-seeds calib correctly on a goal-area camera. Known cosmetic noise carried over from M4: formation chip labels (e.g. "7-1") reflect tracked-subset counts.
+
+## What remains for the real target (RTX-3060, SPEC S7 15 FPS)
+
+- **Export both models to ONNX -> TensorRT** (`yolo export format=engine half=True`): v8x player detect at 960 runs ~8–12 ms on a 3060 vs ~300 ms MPS here; pitch-pose at 640 ~4 ms. That alone clears 15 fps with the current single-frame loop.
+- If headroom is still short: v8m/v8l player weights (fine-tune from the same Roboflow dataset), detect at 720–800, calib fit every 8–10 frames (hold is cheap and HOLD_MAX_S allows 2 s), batch=2 pipelining of decode/infer.
+- Raise proc fps first, then re-check event detectors: at >= 8 fps sampling possession spells survive and press/back-pass/iso should fire live (they already do offline at 10 fps stride-3).
+- Ball: re-enable the dedicated ball model (fits in >8 GB VRAM budgets) or the high-res crop path from C9 for real possession quality.
+
+## Try it live
+
+1. `uv run python -m bto.host.server` (from the repo root; add `--imgsz 960 --device auto` to taste). First stream connect lazy-loads models (~3–8 s).
+2. **No-install demo**: open `http://127.0.0.1:8517/` — the bundled 60 s cwc clip plays with the live overlay (badge: connecting -> live; replays show "overlay off").
+3. **Real site**: `chrome://extensions` -> enable *Developer mode* -> *Load unpacked* -> select the `extension/` directory. Open any page with a non-DRM `<video>` (FIFA+ free replays, YouTube full matches); the content script finds the largest video and overlays automatically. DRM/EME streams (Widevine) black out capture — the badge reads "DRM protected" (known product risk per SPEC S4.1).

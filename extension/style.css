@@ -1,0 +1,50 @@
+/* BTO Telestrator — overlay canvas + status badge.
+   Injected elements live at document.documentElement level and are
+   positioned with `position: fixed` synced to the target <video>'s
+   getBoundingClientRect() by content.js. */
+
+.bto-overlay-canvas {
+  position: fixed;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  z-index: 2147483646;
+}
+
+.bto-status-badge {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 2147483647;
+  pointer-events: none;
+  font: 600 11px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  padding: 3px 8px;
+  border-radius: 10px;
+  color: #fff;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+  background: rgba(60, 60, 60, 0.75);
+  transition: background-color 0.2s ease;
+  white-space: nowrap;
+}
+
+.bto-status-connecting {
+  background: rgba(150, 130, 20, 0.8);
+}
+
+.bto-status-live {
+  background: rgba(20, 130, 60, 0.8);
+}
+
+.bto-status-overlay-off {
+  background: rgba(90, 90, 90, 0.8);
+}
+
+.bto-status-drm {
+  background: rgba(160, 30, 30, 0.85);
+}
+
+.bto-status-host-down {
+  background: rgba(160, 30, 30, 0.85);
+}

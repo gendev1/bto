@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "BTO Telestrator",
+  "version": "0.1.0",
+  "description": "Broadcast Tactical Overlay: draws live tactical overlays (formations, matchups, offside line, back-pass callouts) on top of soccer broadcast video playing in the page.",
+  "action": {
+    "default_title": "BTO Telestrator"
+  },
+  "host_permissions": [
+    "http://127.0.0.1:8517/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["capture.js", "draw.js", "content.js"],
+      "css": ["style.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}
