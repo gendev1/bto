@@ -243,26 +243,40 @@ def create_app(imgsz: int = 960, device: str = "auto", pipeline_kw: dict | None 
             recv_times: list[float] = []
 
             async def reader():
-                while True:
-                    data = await ws.receive_bytes()
-                    if len(data) < HEADER_LEN:
-                        continue
-                    seq, t_video = struct.unpack(HEADER_FMT, data[:HEADER_LEN])
-                    jpeg_bytes = data[HEADER_LEN:]
-                    item = (seq, t_video, jpeg_bytes, time.monotonic())
-                    if queue.full():
+                try:
+                    while True:
+                        data = await ws.receive_bytes()
+                        if len(data) < HEADER_LEN:
+                            continue
+                        seq, t_video = struct.unpack(HEADER_FMT, data[:HEADER_LEN])
+                        jpeg_bytes = data[HEADER_LEN:]
+                        item = (seq, t_video, jpeg_bytes, time.monotonic())
+                        if queue.full():
+                            try:
+                                queue.get_nowait()
+                                dropped["n"] += 1
+                            except asyncio.QueueEmpty:
+                                pass
+                        await queue.put(item)
+                finally:
+                    # Client went away (or reader died): wake the processor loop
+                    # with a sentinel or it blocks on queue.get() forever and
+                    # state.streaming leaks True, rejecting every reconnect.
+                    while queue.full():
                         try:
                             queue.get_nowait()
-                            dropped["n"] += 1
                         except asyncio.QueueEmpty:
-                            pass
-                    await queue.put(item)
+                            break
+                    queue.put_nowait(None)
 
             reader_task = asyncio.create_task(reader())
             last_proc_end = None
             try:
                 while True:
-                    seq, t_video, jpeg_bytes, recv_t = await queue.get()
+                    item = await queue.get()
+                    if item is None:  # reader died: client disconnected
+                        break
+                    seq, t_video, jpeg_bytes, recv_t = item
                     recv_times.append(recv_t)
                     if len(recv_times) > 30:
                         recv_times.pop(0)
