@@ -44,8 +44,10 @@ Two entry points:
 Draw-order / cap rules mirror overlay.py exactly: formation + offside_line
 are always-on layers (every active instance drawn); everything else is an
 "event" (back_pass, triangle, isolation, 1v1, NvN, press, overlap,
-underlap), capped at MAX_EVENTS=3 by confidence, drawn in that order.
-"block" detections are not rendered (overlay.py doesn't draw them either).
+underlap), filtered by the shared selectivity floors (MIN_EVENT_CONF,
+MIN_EVENT_DUR_S with the back_pass/overlap/underlap exemption) and capped
+at the imported MAX_EVENTS by confidence, drawn in that order. "block"
+detections are not rendered (overlay.py doesn't draw them either).
 """
 from __future__ import annotations
 
@@ -67,6 +69,9 @@ from bto.render.overlay import (
     COLOR_TRIANGLE,
     FADE_S,
     MAX_EVENTS,
+    MIN_EVENT_CONF,
+    MIN_EVENT_DUR_EXEMPT,
+    MIN_EVENT_DUR_S,
     PRESS_COLORS,
     circle_m,
     project,
@@ -405,7 +410,21 @@ def detections_to_prims(detections, H=None, t=None, w=None, h=None) -> list[dict
     for d in newest_offside.values():
         out.extend(_prims_offside(d, t, Hinv, w, h))
 
-    events = sorted((d for d in active if _is_event(_get(d, "type"))), key=lambda d: -_get(d, "confidence", 0.0))
+    # Precision-tuning selectivity (mirrors overlay.py's schedule pre-pass as
+    # far as a stateless per-frame call allows): confidence floor + minimum
+    # duration, with the same exemption for types whose lifetime is
+    # inherently the short ball-flight / run window. No cross-call cooldown
+    # state: this function is stateless per frame by design.
+    def _keep_event(d):
+        if _get(d, "confidence", 0.0) < MIN_EVENT_CONF:
+            return False
+        dtype = _get(d, "type")
+        if dtype in MIN_EVENT_DUR_EXEMPT:
+            return True
+        return (_get(d, "t_end") - _get(d, "t_start")) >= MIN_EVENT_DUR_S
+
+    events = sorted((d for d in active if _is_event(_get(d, "type")) and _keep_event(d)),
+                    key=lambda d: -_get(d, "confidence", 0.0))
     for d in events[:MAX_EVENTS]:
         out.extend(_event_prims(d, t, Hinv, w, h))
 

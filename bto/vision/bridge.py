@@ -23,6 +23,9 @@ Rules (frozen M3 interchange):
 """
 
 import json
+from collections import deque
+from math import hypot
+from statistics import median
 
 from bto.core import AWAY, HOME, Frame, PlayerPos
 
@@ -31,6 +34,21 @@ Y_MIN, Y_MAX = -3.0, 71.0
 MAX_GAP_S = 2.0
 MIN_SEGMENT_S = 5.0
 HALF_X = 52.5
+# Ball trust (M3 precision pass): ball.jsonl rows are either real detections
+# (src='det') or Kalman coasting (src='kf'). Long kf coasts (observed up to
+# ~14s) park a phantom ball on the pitch and hand possession to whoever
+# stands nearest, which poisons every ball-gated detector (press/back_pass/
+# isolation possession misattribution). Only trust a coasted ball this many
+# seconds past the last real detection; beyond that the Frame gets ball=None
+# (possession() already tolerates short ball gaps).
+BALL_COAST_MAX_S = 0.5
+# Causal smoothing (M3 precision pass). Broadcast tracking is jittery and
+# ByteTrack id reuse produces single-frame teleports; the audit measured fake
+# 30-180 m/s ball jumps feeding impossible back-pass arrows. All smoothing is
+# CAUSAL (no future frames) so the live host can reuse this path unchanged.
+PLAYER_TELEPORT_SPEED = 12.0  # m/s: faster than any player => track break
+BALL_TELEPORT_SPEED = 40.0    # m/s: faster than any kick => mistrack
+BALL_REACQUIRE_S = 0.5        # s: after this long, trust the new ball point
 
 
 def _read_jsonl(path):
@@ -58,9 +76,12 @@ def _in_bounds(p):
     return X_MIN <= p[0] <= X_MAX and Y_MIN <= p[1] <= Y_MAX
 
 
-def _project_row(row, h, ball_by_idx):
+def _project_row(row, h, ball_by_idx, ball_trusted=None):
     """One perception row -> (t, raw_players, ball_m). raw player: (tid, tag, x, y)
-    with tag in {'home','away','gk'}; refs and out-of-bounds points dropped."""
+    with tag in {'home','away','gk'}; refs and out-of-bounds points dropped.
+
+    ball_trusted: optional set of frame_idx whose ball position is trusted
+    (real detection or short Kalman coast); other frames get ball=None."""
     players = []
     for p in row.get("players") or []:
         team = p.get("team")
@@ -79,12 +100,73 @@ def _project_row(row, h, ball_by_idx):
     ball_px = row.get("ball")
     if ball_px is None and ball_by_idx is not None:
         ball_px = ball_by_idx.get(row["frame_idx"])
+    if ball_trusted is not None and row["frame_idx"] not in ball_trusted:
+        ball_px = None  # stale Kalman coast: no ball is better than a phantom
     ball_m = None
     if ball_px is not None:
         pt = _project(h, ball_px[0], ball_px[1])
         if pt is not None and _in_bounds(pt):
             ball_m = (pt[0], pt[1])
     return row["t"], players, ball_m
+
+
+def _smooth_raw(raw):
+    """Causal per-track smoothing over one raw segment (M3 precision pass).
+
+    - Players: emitted position is the component-wise median of the last 3
+      accepted raw points (kills single-frame spikes), then a trailing EMA
+      (alpha=0.5) on the median output settles residual jitter. Adds only
+      ~0.1-0.2 s lag at 10-12.5 fps.
+    - Player teleport reset: a raw step implying > PLAYER_TELEPORT_SPEED vs
+      the last accepted point is a track break (ByteTrack swap/reuse); the
+      buffer and EMA reset to the new point instead of blending two players.
+    - Ball: a new point implying > BALL_TELEPORT_SPEED within
+      BALL_REACQUIRE_S of the last accepted point is rejected (ball=None for
+      that frame -- the audit measured 30-180 m/s fake jumps); if rejection
+      persists past BALL_REACQUIRE_S the new point is accepted (re-acquire,
+      buffer reset). Accepted ball points get the same median-of-3.
+
+    State is per segment: callers must pass one contiguous raw segment.
+    """
+    buf: dict = {}  # tid -> [deque[(x, y)] (accepted raw), last_t, (ema_x, ema_y)]
+    ball_buf: deque = deque(maxlen=3)
+    last_ball = None  # (x, y, t) of the last ACCEPTED raw ball point
+    out = []
+    for t, players, ball in raw:
+        smoothed = []
+        for tid, tag, x, y in players:
+            st = buf.get(tid)
+            if st is not None:
+                pts, last_t, _ema = st
+                dt = t - last_t
+                lx, ly = pts[-1]
+                if dt > 0 and hypot(x - lx, y - ly) / dt > PLAYER_TELEPORT_SPEED:
+                    st = None  # track break: never blend across the jump
+            if st is None:
+                st = [deque(maxlen=3), t, (x, y)]
+                buf[tid] = st
+            st[0].append((x, y))
+            st[1] = t
+            mx = median(p[0] for p in st[0])
+            my = median(p[1] for p in st[0])
+            ex, ey = st[2]
+            st[2] = (0.5 * mx + 0.5 * ex, 0.5 * my + 0.5 * ey)
+            smoothed.append((tid, tag, st[2][0], st[2][1]))
+
+        ball_m = None
+        if ball is not None and last_ball is not None:
+            dt = t - last_ball[2]
+            if dt > 0 and hypot(ball[0] - last_ball[0], ball[1] - last_ball[1]) / dt > BALL_TELEPORT_SPEED:
+                if dt < BALL_REACQUIRE_S:
+                    ball = None  # jitter/teleport: no ball beats a phantom
+                else:
+                    ball_buf.clear()  # rejection persisted: re-acquire here
+        if ball is not None:
+            last_ball = (ball[0], ball[1], t)
+            ball_buf.append(ball)
+            ball_m = (median(p[0] for p in ball_buf), median(p[1] for p in ball_buf))
+        out.append((t, smoothed, ball_m))
+    return out
 
 
 def _finalize(raw):
@@ -146,10 +228,24 @@ def build_frames(perception_jsonl, calib_jsonl, ball_jsonl=None):
     perception = _read_jsonl(perception_jsonl)
     calib = {r["frame_idx"]: _flat_h(r.get("H")) for r in _read_jsonl(calib_jsonl)}
     ball_by_idx = None
+    ball_trusted = None
     if ball_jsonl is not None:
-        ball_by_idx = {
-            r["frame_idx"]: r["ball"] for r in _read_jsonl(ball_jsonl) if r.get("ball")
-        }
+        ball_rows = _read_jsonl(ball_jsonl)
+        ball_by_idx = {r["frame_idx"]: r["ball"] for r in ball_rows if r.get("ball")}
+        # trust real detections, and Kalman coasts <= BALL_COAST_MAX_S old
+        ball_trusted = set()
+        last_det_t = None
+        for r in ball_rows:
+            if r.get("src") == "det" and r.get("ball"):
+                last_det_t = r.get("t")
+                ball_trusted.add(r["frame_idx"])
+            elif (
+                r.get("ball")
+                and last_det_t is not None
+                and r.get("t") is not None
+                and r["t"] - last_det_t <= BALL_COAST_MAX_S
+            ):
+                ball_trusted.add(r["frame_idx"])
 
     segments_raw, cur, broken = [], [], False
     for row in perception:
@@ -163,7 +259,7 @@ def build_frames(perception_jsonl, calib_jsonl, ball_jsonl=None):
             segments_raw.append(cur)
             cur = []
         broken = False
-        cur.append(_project_row(row, h, ball_by_idx))
+        cur.append(_project_row(row, h, ball_by_idx, ball_trusted))
     if cur:
         segments_raw.append(cur)
 
@@ -171,7 +267,7 @@ def build_frames(perception_jsonl, calib_jsonl, ball_jsonl=None):
     for raw in segments_raw:
         if raw[-1][0] - raw[0][0] < MIN_SEGMENT_S:
             continue
-        segments.append(_finalize(raw))
+        segments.append(_finalize(_smooth_raw(raw)))
     return segments
 
 

@@ -49,12 +49,24 @@ def _windows(frames: list[Frame], window_s: float):
         i0 = i1
 
 
-def _team_window(frames: list[Frame], i0: int, i1: int, team: str):
+def _team_window(
+    frames: list[Frame],
+    i0: int,
+    i1: int,
+    team: str,
+    min_presence: float = 0.5,
+    max_players: int = 11,
+):
     """Mean position per track over frames[i0:i1].
 
     Returns (ids, xy, depth) with xy an (n, 2) array of mean pitch positions
     and depth the attacking-axis projection, both sorted by depth ascending
     (rearmost first). ids is the matching track_id list.
+
+    Ghost/duplicate tracker ids (broadcast id churn) are filtered out: a track
+    must be present in at least min_presence of the window's frames, and at
+    most max_players tracks (the most-present ones) are kept -- an 11-a-side
+    team can never contribute more than 11 real players to a window.
     """
     sums: dict[str, list[float]] = {}
     for f in frames[i0:i1]:
@@ -65,6 +77,11 @@ def _team_window(frames: list[Frame], i0: int, i1: int, team: str):
             s[0] += p.x
             s[1] += p.y
             s[2] += 1.0
+    n_frames = max(i1 - i0, 1)
+    sums = {tid: s for tid, s in sums.items() if s[2] / n_frames >= min_presence}
+    if len(sums) > max_players:
+        keep = sorted(sums, key=lambda tid: (-sums[tid][2], tid))[:max_players]
+        sums = {tid: sums[tid] for tid in keep}
     if not sums:
         return [], np.empty((0, 2)), np.empty(0)
     ids = sorted(sums)
@@ -123,15 +140,23 @@ def _hull(points: np.ndarray) -> list[tuple[float, float]]:
 
 
 def detect_formation(
-    frames: list[Frame], window_s: float = 5.0, min_line_gap: float = 5.0
+    frames: list[Frame],
+    window_s: float = 5.0,
+    min_line_gap: float = 5.0,
+    min_outfield: int = 6,
 ) -> list[Detection]:
-    """Formation shape per team per window; see module docstring for geometry."""
+    """Formation shape per team per window; see module docstring for geometry.
+
+    A window only emits when at least min_outfield stable outfield tracks are
+    visible after GK drop -- a formation label built from a handful of players
+    (or from ghost-track soup) is meaningless to a viewer.
+    """
     out: list[Detection] = []
     for team in (HOME, AWAY):
         prev_label: str | None = None
         for i0, i1 in _windows(frames, window_s):
             ids, xy, depth = _team_window(frames, i0, i1, team)
-            if len(ids) < 3:  # need GK + at least 2 outfield
+            if len(ids) < min_outfield + 1:  # GK + min_outfield outfield players
                 continue
             ids, xy, depth = ids[1:], xy[1:], depth[1:]  # drop rearmost = GK
             lines = _lines(xy, depth, min_line_gap)
@@ -161,16 +186,24 @@ def detect_formation(
 
 
 def detect_block(
-    frames: list[Frame], window_s: float = 2.0, min_line_gap: float = 5.0
+    frames: list[Frame],
+    window_s: float = 2.0,
+    min_line_gap: float = 5.0,
+    min_outfield: int = 6,
 ) -> list[Detection]:
     """Block compactness + line height per team per window (both teams --
-    possession is not known here); see module docstring for geometry."""
+    possession is not known here); see module docstring for geometry.
+
+    Like detect_formation, a window only emits with at least min_outfield
+    stable outfield tracks after GK drop -- 'block' geometry from 2-3 players
+    on a close-up frame is noise, not team shape.
+    """
     third = PITCH_LENGTH / 3.0
     out: list[Detection] = []
     for team in (HOME, AWAY):
         for i0, i1 in _windows(frames, window_s):
             ids, xy, depth = _team_window(frames, i0, i1, team)
-            if len(ids) < 3:
+            if len(ids) < min_outfield + 1:  # GK + min_outfield outfield
                 continue
             ids, xy, depth = ids[1:], xy[1:], depth[1:]  # drop rearmost = GK
             splits = _line_splits(depth, min_line_gap)

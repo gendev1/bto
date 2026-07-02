@@ -48,3 +48,30 @@ class Detection:
 
 def other(team: str) -> str:
     return AWAY if team == HOME else HOME
+
+
+def track_velocity(
+    frames: list[Frame], i: int, track_id: str, window_s: float = 0.4
+) -> tuple[float, float] | None:
+    """Smoothed (vx, vy) in m/s of track_id at frame i.
+
+    Positions are already bridge-smoothed; this is the shared smoothed-
+    velocity helper for closing-speed/run/matchup estimation. Displacement of
+    track_id between frame i and the earliest frame within the trailing
+    window_s, divided by dt; None if the track is missing at either end or
+    dt <= 0.
+    """
+    if not frames or i < 0 or i >= len(frames):
+        return None
+    f = frames[i]
+    j = i
+    while j > 0 and f.t - frames[j - 1].t <= window_s:
+        j -= 1
+    dt = f.t - frames[j].t
+    if dt <= 0:
+        return None
+    cur = next((p for p in f.players if p.track_id == track_id), None)
+    prev = next((p for p in frames[j].players if p.track_id == track_id), None)
+    if cur is None or prev is None:
+        return None
+    return ((cur.x - prev.x) / dt, (cur.y - prev.y) / dt)

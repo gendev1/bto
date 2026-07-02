@@ -4,7 +4,7 @@ Per frame, per defending team, the offside line is approximated as the x
 position of the SECOND-rearmost defender relative to the goal that team
 defends (the rearmost defender is usually the goalkeeper). The raw per-frame
 line is smoothed with a trailing moving average over `smooth_s` seconds, then
-resampled into ~1s segments emitted as one Detection each.
+resampled into ~`_SEGMENT_S`-second segments emitted as one Detection each.
 
 NEVER present this as an offside call (SPEC S9) -- it is an approximation
 for overlay purposes only; geometry carries 'approximate': True and the
@@ -19,7 +19,10 @@ geometry dict keys:
 
 from bto.core import AWAY, Detection, Frame, HOME
 
-_SEGMENT_S = 1.0  # resample cadence: one Detection per ~1s
+# Resample cadence: one Detection per ~2s. Was 1.0s; the always-on line
+# chained a fresh detection pair every second for the whole clip, which read
+# as spam even though the geometry is accurate (M3 precision pass).
+_SEGMENT_S = 2.0
 
 
 def _second_rearmost_x(frame: Frame, team: str) -> float | None:
@@ -67,7 +70,7 @@ def offside_line(frames: list[Frame], smooth_s: float = 0.5) -> list[Detection]:
             avg_x = sum(v[1] for v in chunk) / len(chunk)
             smoothed.append((raw[k][0] if raw[k] is not None else frames[k].t, avg_x))
 
-        # resample into contiguous ~1s segments
+        # resample into contiguous ~_SEGMENT_S segments
         seg_samples: list[tuple[float, float]] = []
         seg_start_t: float | None = None
         for k, s in enumerate(smoothed):

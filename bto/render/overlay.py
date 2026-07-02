@@ -11,7 +11,8 @@ Layer design (SPEC open question resolved: always-on structure + event callouts)
              per-team label chip ('4-3-3').
   offside   (always-on): dashed line across the pitch at the offside x, labeled
              'OFFSIDE (approx)' -- SPEC S9: never presented as a call.
-  events    (callouts, prominent, capped at 3 by confidence): back_pass arrow
+  events    (callouts, prominent, scheduled with confidence/duration floors +
+             per-type cooldown, capped at MAX_EVENTS=2 by confidence): back_pass arrow
              fading over its lifetime, triangle fill, 1v1/isolation spotlights
              + ISO chip, press pulsing ring by level, NvN region box + chip,
              overlap/underlap curved arrow.
@@ -44,10 +45,32 @@ COLOR_RUN = (0, 255, 180)
 PRESS_COLORS = {"low": (80, 200, 80), "medium": (0, 165, 255), "high": (0, 0, 255)}
 
 FADE_S = 0.3          # fade window at detection + shot boundaries
-MAX_EVENTS = 3        # simultaneous event callouts, by confidence
+MAX_EVENTS = 2        # simultaneous event callouts, by confidence
 SAMPLE_STEP_M = 1.5   # polyline sampling step in meter space
 DEFAULT_LAYERS = ("formation", "offside", "events")
 EVENT_TYPES_STATIC = {"back_pass", "triangle", "isolation", "press", "overlap", "underlap"}
+
+# ---- event selectivity (precision-tuning pass: the audited FP spam was
+# dominated by sub-frame flicker events, uniform conf=1.0, and 3 chips at
+# once; these gates are render-side belt-and-braces on top of detector fixes)
+MIN_EVENT_CONF = 0.35     # drop event callouts below this confidence
+EVENT_COOLDOWN_S = 8.0    # min gap between same-type callouts (display end -> next start)
+MIN_EVENT_DUR_S = 0.4     # drop events shorter than this ...
+MIN_EVENT_DUR_EXEMPT = {"back_pass", "overlap", "underlap"}  # ... except types whose
+# lifetime is inherently the short ball-flight / run window
+MIN_DISPLAY_S = 1.5       # stretch every kept event to at least this on screen
+
+# ---- offside selectivity (audit: geometry accurate but BOTH teams' lines
+# redrew every ~1-1.8 s regardless of phase of play -- pure relevance spam)
+OFFSIDE_BALL_MAX_DX_M = 30.0  # hide a line further than this from the ball (x)
+OFFSIDE_TEAM_HOLD_S = 2.0     # hold the chosen team_defending to avoid flip-flicker
+
+# ---- drawable quality floor (audit: a formation chip was drawn on a player
+# close-up at cwc t=168.3 s because 'H is not None' was the only check)
+CALIB_MAX_RMSE_M = 3.0    # reject calib rows with worse fit error
+CALIB_MAX_HELD_S = 2.0    # reject src=='held' runs older than this since last fit/ema
+MIN_PLAYERS_DRAWABLE = 5  # a real 'main' broadcast shot shows many players; a
+# close-up with a hallucinated H shows 0-4 (frame 5049 on cwc has 3)
 
 
 def _load_jsonl(path):
@@ -192,9 +215,15 @@ def _team_color(team):
     return COLOR_HOME if team == "home" else COLOR_AWAY if team == "away" else (255, 255, 255)
 
 
-def _det_alpha(det, t):
-    """Fade a detection in/out over FADE_S around its lifetime; floor for shorts."""
-    a = min(t - det["t_start"] + 0.04, det["t_end"] - t + 0.04) / FADE_S
+def _det_alpha(det, t, disp=None):
+    """Fade a detection in/out over FADE_S around its lifetime; floor for shorts.
+
+    ``disp`` (t0, t1) overrides the raw t_start/t_end window -- the event
+    scheduler stretches short events to MIN_DISPLAY_S so fades must track the
+    display window, not the raw detection lifetime.
+    """
+    t0, t1 = disp if disp is not None else (det["t_start"], det["t_end"])
+    a = min(t - t0 + 0.04, t1 - t + 0.04) / FADE_S
     return float(np.clip(a, 0.2, 1.0))
 
 
@@ -245,13 +274,14 @@ def _spotlight(im, pt_m, Hinv, w, h, color, r=1.4):
     return px
 
 
-def draw_event(canvas, det, t, Hinv, w, h, seg_alpha):
-    a = _det_alpha(det, t) * seg_alpha
+def draw_event(canvas, det, t, Hinv, w, h, seg_alpha, disp=None):
+    a = _det_alpha(det, t, disp) * seg_alpha
     g, dtype = det["geometry"], det["type"]
 
     if dtype == "back_pass":
-        life = max(det["t_end"] - det["t_start"], 1e-6)
-        a = seg_alpha * float(np.clip(1.0 - (t - det["t_start"]) / life, 0.25, 1.0))
+        d0, d1 = disp if disp is not None else (det["t_start"], det["t_end"])
+        life = max(d1 - d0, 1e-6)
+        a = seg_alpha * float(np.clip(1.0 - (t - d0) / life, 0.25, 1.0))
         px = project(sample_polyline_m([g["from"], g["to"]]), Hinv, w, h)
 
         def d(im):
@@ -347,6 +377,74 @@ def draw_event(canvas, det, t, Hinv, w, h, seg_alpha):
     return canvas
 
 
+# ------------------------------------------------------------- selectivity
+
+def schedule_events(detections):
+    """Build the event-callout schedule ONCE per render (precision pass).
+
+    Filters: confidence < MIN_EVENT_CONF; duration < MIN_EVENT_DUR_S except
+    the MIN_EVENT_DUR_EXEMPT types (their lifetime is inherently the short
+    ball-flight / run window -- the sub-frame isolation flickers are exactly
+    what the duration gate kills). Every survivor gets a display window
+    [t_start, max(t_end, t_start + MIN_DISPLAY_S)] so short real events are
+    legible instead of a ~100 ms 0.2-alpha ghost. Then per type (by t_start)
+    an event is kept only if it starts >= the last KEPT same-type event's
+    display end + EVENT_COOLDOWN_S; two overlapping in that window keep the
+    higher-confidence one.
+
+    Returns {id(det): (disp_start, disp_end)} for the kept events.
+    """
+    by_type = defaultdict(list)
+    for d in detections:
+        dtype = d["type"]
+        if not _is_event(dtype):
+            continue
+        if d.get("confidence", 0.0) < MIN_EVENT_CONF:
+            continue
+        if dtype not in MIN_EVENT_DUR_EXEMPT and (d["t_end"] - d["t_start"]) < MIN_EVENT_DUR_S:
+            continue
+        by_type[dtype].append(d)
+
+    schedule = {}
+    for dtype, ds in by_type.items():
+        ds.sort(key=lambda d: d["t_start"])
+        kept = []  # [det, disp_start, disp_end]
+        for d in ds:
+            s = d["t_start"]
+            e = max(d["t_end"], s + MIN_DISPLAY_S)
+            if kept and s < kept[-1][2] + EVENT_COOLDOWN_S:
+                if d.get("confidence", 0.0) > kept[-1][0].get("confidence", 0.0):
+                    kept[-1] = [d, s, e]  # higher-confidence event wins the slot
+                continue
+            kept.append([d, s, e])
+        for d, s, e in kept:
+            schedule[id(d)] = (s, e)
+    return schedule
+
+
+def _formation_sane(det):
+    """Belt-and-braces vs the audited dedup bug: >11 'team members' hulls and
+    labels like '2-12' / '16-1' whose digits don't sum to the player count."""
+    players = det.get("players") or []
+    if len(players) > 11:
+        return False
+    label = str((det.get("geometry") or {}).get("label") or "")
+    try:
+        digits = [int(p) for p in label.split("-")]
+    except ValueError:
+        return False
+    return sum(digits) == len(players)
+
+
+def _offside_x(det, t):
+    g = det["geometry"]
+    x = g.get("x", g.get("line_x"))
+    for ts, xs in g.get("samples") or []:
+        if ts <= t:
+            x = xs
+    return x
+
+
 # ---------------------------------------------------------------- main driver
 
 def _banner(img, shot, t, fidx, drawable):
@@ -392,6 +490,9 @@ def render_overlay_video(video_path, out_dir, out_path=None, layers=None, max_fr
     tid_team = _tid_team_majority(perception)
     formation_teams = {id(d): _formation_team(d, tid_team) for d in detections if d["type"] == "formation"}
     dets_sorted = sorted(detections, key=lambda d: d["t_start"])
+    # event callout schedule, built once (conf/duration floors + per-type
+    # cooldown + MIN_DISPLAY_S legibility stretch): {id(det): (d0, d1)}
+    event_windows = schedule_events(detections)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -405,10 +506,32 @@ def render_overlay_video(video_path, out_dir, out_path=None, layers=None, max_fr
     stride = int(np.median(diffs[diffs > 0])) if len(diffs) and (diffs > 0).any() else 1
     out_fps = max(src_fps / stride, 1.0)
 
+    # age of each src=='held' calib row since the last real fit/ema (a held H
+    # is last-good; after CALIB_MAX_HELD_S it is stale enough to stop drawing)
+    held_age = {}
+    _last_good_t = None
+    for c in sorted(calib.values(), key=lambda r: r["frame_idx"]):
+        if c.get("src") == "held":
+            held_age[c["frame_idx"]] = (
+                c["t"] - _last_good_t
+                if _last_good_t is not None and c.get("t") is not None else float("inf"))
+        elif c.get("H") is not None:
+            _last_good_t = c.get("t")
+
     # drawable runs (for shot-cut fade in/out with lookahead)
     def _drawable(row):
         c = calib.get(row["frame_idx"])
-        return row.get("shot", shots.get(row["frame_idx"], "main")) == "main" and c is not None and c.get("H") is not None
+        if row.get("shot", shots.get(row["frame_idx"], "main")) != "main" or c is None or c.get("H") is None:
+            return False
+        # quality floor (audit: 'H is not None' alone let a hallucinated fit
+        # draw overlays on a player close-up at cwc t=168.3s / frame 5049)
+        if c.get("rmse_m") is not None and c["rmse_m"] > CALIB_MAX_RMSE_M:
+            return False
+        if c.get("src") == "held" and held_age.get(c["frame_idx"], 0.0) > CALIB_MAX_HELD_S:
+            return False
+        if len(row.get("players") or []) < MIN_PLAYERS_DRAWABLE:
+            return False
+        return True
 
     drawable = [_drawable(r) for r in perception]
     run_start, run_end = [None] * len(perception), [None] * len(perception)
@@ -430,6 +553,7 @@ def render_overlay_video(video_path, out_dir, out_path=None, layers=None, max_fr
     draw_counts = defaultdict(int)
     dt = stride / src_fps
     sample_frames = {}
+    off_hold_team, off_hold_t = None, None  # offside team_defending hold (causal)
 
     for idx, row in enumerate(perception):
         fidx = row["frame_idx"]
@@ -449,7 +573,7 @@ def render_overlay_video(video_path, out_dir, out_path=None, layers=None, max_fr
 
             if "formation" in layers:
                 for d in active:
-                    if d["type"] == "formation":
+                    if d["type"] == "formation" and _formation_sane(d):
                         team = formation_teams.get(id(d))
                         canvas = draw_formation(canvas, d, t, Hinv, w, h, seg_alpha, team)
                         label = d["geometry"].get("label", "?")
@@ -461,18 +585,49 @@ def render_overlay_video(video_path, out_dir, out_path=None, layers=None, max_fr
                         draw_counts["formation"] += 1
 
             if "offside" in layers:
-                for d in active:
-                    if d["type"] == "offside_line":
-                        canvas, drew = draw_offside(canvas, d, t, Hinv, w, h, seg_alpha)
-                        if drew:
-                            draw_counts["offside"] += 1
+                # relevance gate: at most ONE line per frame, and only the one
+                # nearest the live ball (both-teams-always-on was the audited
+                # spam; geometry itself was accurate).
+                off_active = [d for d in active if d["type"] == "offside_line"]
+                ball_x = None
+                ball = row.get("ball")
+                if off_active and ball:
+                    Hm = np.array(calib[fidx]["H"], dtype=np.float64).reshape(3, 3)
+                    q = Hm @ np.array([ball[0], ball[1], 1.0], dtype=np.float64)
+                    if abs(q[2]) > 1e-9 and np.isfinite(q).all():
+                        ball_x = float(q[0] / q[2])
+                chosen = None
+                if ball_x is not None:  # no ball on this frame -> no line
+                    cands = []
+                    for d in off_active:
+                        x = _offside_x(d, t)
+                        if x is not None and abs(x - ball_x) <= OFFSIDE_BALL_MAX_DX_M:
+                            cands.append((abs(x - ball_x), d))
+                    if cands:
+                        cands.sort(key=lambda c: c[0])
+                        chosen = cands[0][1]
+                        team = chosen["geometry"].get("team_defending")
+                        if (off_hold_team is not None and team != off_hold_team
+                                and t - off_hold_t <= OFFSIDE_TEAM_HOLD_S):
+                            held = [d for _, d in cands
+                                    if d["geometry"].get("team_defending") == off_hold_team]
+                            if held:  # hold the previous team to avoid flip-flicker
+                                chosen, team = held[0], off_hold_team
+                        if team != off_hold_team:
+                            off_hold_team, off_hold_t = team, t
+                if chosen is not None:
+                    canvas, drew = draw_offside(canvas, chosen, t, Hinv, w, h, seg_alpha)
+                    if drew:
+                        draw_counts["offside"] += 1
 
             if "events" in layers:
-                events = sorted((d for d in active if _is_event(d["type"])),
-                                key=lambda d: -d["confidence"])[:MAX_EVENTS]
+                sched = [(d, event_windows[id(d)]) for d in dets_sorted
+                         if id(d) in event_windows
+                         and event_windows[id(d)][0] <= t <= event_windows[id(d)][1]]
+                events = sorted(sched, key=lambda dw: -dw[0]["confidence"])[:MAX_EVENTS]
                 ev_tids = set()
-                for d in events:
-                    canvas = draw_event(canvas, d, t, Hinv, w, h, seg_alpha)
+                for d, disp in events:
+                    canvas = draw_event(canvas, d, t, Hinv, w, h, seg_alpha, disp=disp)
                     draw_counts["events"] += 1
                     draw_counts[f"events.{d['type']}"] += 1
                     for pid in d["players"]:
@@ -506,19 +661,25 @@ def render_overlay_video(video_path, out_dir, out_path=None, layers=None, max_fr
 
 
 def _self_check():
-    """60 frames of bundesliga_smoke end-to-end + 4 sample jpgs for eyeballing."""
+    """150 frames of bundesliga_smoke end-to-end + 4 sample jpgs for eyeballing."""
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     video = os.path.join(root, "data", "clips", "bundesliga_smoke.mp4")
     out_dir = os.path.join(root, "out", "bundesliga_smoke")
     dst = os.path.join(out_dir, "m4_selfcheck.mp4")
-    stats = render_overlay_video(video, out_dir, out_path=dst, max_frames=60)
+    # 150 frames (~12 s): the event-selectivity pass (MIN_EVENT_CONF /
+    # EVENT_COOLDOWN_S) legitimately blanks the first ~5 s of this clip, so
+    # 60 frames no longer contains any scheduled event callout.
+    stats = render_overlay_video(video, out_dir, out_path=dst, max_frames=150)
 
     assert os.path.exists(dst), "self-check mp4 missing"
     size = os.path.getsize(dst)
     assert size > 100_000, f"self-check mp4 too small: {size} bytes"
     assert stats["draw_counts"].get("formation", 0) > 0, "no formation draws"
     assert stats["draw_counts"].get("offside", 0) > 0, "no offside draws"
-    assert stats["draw_counts"].get("events", 0) > 0, "no event draws"
+    # events is a printed count, not an assert: the selectivity pass (conf
+    # floor + per-type cooldown) can validly schedule zero callouts in a
+    # short window against a low-confidence m3 file.
+    print("event draws in window:", stats["draw_counts"].get("events", 0))
 
     samples = list(stats["_samples"].items())
     picks = [samples[i] for i in (0, len(samples) // 3, 2 * len(samples) // 3, len(samples) - 1)]

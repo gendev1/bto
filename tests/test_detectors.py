@@ -161,13 +161,15 @@ def test_detect_triangles_blocked_lane_does_not_fire():
 
 
 def _backpass_seq(b_pos):
+    # 0.5s release->reception gap over 10m = 20 m/s, inside the 28 m/s
+    # implied-ball-speed cap of detect_back_passes.
     seq = []
-    for i in range(12):
+    for i in range(15):
         t = i * 0.1
         actors = [PlayerPos("A", HOME, 30.0, 34.0), PlayerPos("B", HOME, *b_pos)]
         if i < 5:
             ball = (30.0, 34.0)
-        elif i < 7:
+        elif i < 9:
             ball = (25.0, 50.0)  # in flight, far from either actor
         else:
             ball = b_pos
@@ -220,8 +222,10 @@ def test_detect_runs_fast_outside_run_is_overlap():
 
 
 def test_detect_pressing_three_closing_defenders_fires():
+    # 50 frames (2s): the pressers reach engage range around t=0.75s, so the
+    # qualifying run (~1.2s) clears the 0.4s persistence gate with margin.
     dt = DT
-    n = 25
+    n = 50
     starts = [(41.0, 34.0), (59.0, 34.0), (50.0, 25.0)]
     frames = []
     for k in range(n):

@@ -155,3 +155,82 @@ Preview eyeball (6 frames from the actual WS replies): hulls/lines land on the p
 1. `uv run python -m bto.host.server` (from the repo root; add `--imgsz 960 --device auto` to taste). First stream connect lazy-loads models (~3–8 s).
 2. **No-install demo**: open `http://127.0.0.1:8517/` — the bundled 60 s cwc clip plays with the live overlay (badge: connecting -> live; replays show "overlay off").
 3. **Real site**: `chrome://extensions` -> enable *Developer mode* -> *Load unpacked* -> select the `extension/` directory. Open any page with a non-DRM `<video>` (FIFA+ free replays, YouTube full matches); the content script finds the largest video and overlays automatically. DRM/EME streams (Widevine) black out capture — the badge reads "DRM protected" (known product risk per SPEC S4.1).
+
+## Precision pass (2026-07-02)
+
+User complaint: "way too many false positives in all generated mp4 files." A read-only audit
+(strict viewer rubric, frames sampled from `out/<stem>/m4_overlay.mp4` and graded by eye against
+the raw video) measured per-type FP fractions, three fix agents tuned detectors + bridge +
+renderer, and a verifier re-ran the pipeline, blind re-graded the new videos, and applied one
+final tightening. Tests stayed green throughout (`uv run pytest -q` = 19 passed).
+
+### Audit: what was wrong (pre-fix)
+
+| type | sampled precision | dominant causes |
+|---|---|---|
+| back_pass | 4 TP / 12 FP (75% FP) | lateral passes flagged as backward; physically impossible ball speeds from stitched non-adjacent touches; confidence uniformly 1.00 |
+| isolation | 2 TP / 13 FP (87% FP) | 36/37 cwc dets were single-frame (~100 ms invisible ghosts); attacker == defender same track id |
+| press | 5 TP / 8 FP (62% FP) | carrier listed as pressing himself (44% of cwc presses); "high"/conf 1.0 with nearest presser 4–8 m away |
+| triangle | 0 TP / 3 FP (100% FP) | no compactness cap (one "triangle" spanned ~40 m touchline-to-touchline) |
+| 1v1 | 2 TP / 8 FP (80% FP) | pure cross-team proximity with zero ball awareness (8/10 were 15–40 m from the ball); frozen t_end geometry displayed for the whole window |
+| 2v2 family | 0 TP / 10 FP (100% FP) | all sampled instances 9–40 m off-ball; one at confidence 0.003; windows up to 8.4 s with static geometry |
+| formation | 0 TP / 16 FP (100% FP) | ghost-tid fusion (up to 24 "players" per team), nonsense labels ("2-12", "21-2"), drew on a player close-up frame |
+| offside_line | 16 TP / 0 FP | geometry accurate (<=1.2 m) but redrawn for both teams every ~1–1.8 s forever — a relevance/frequency problem |
+
+### Fixes (detector + bridge + renderer)
+
+- **bridge**: causal per-segment smoothing (median-of-3 + EMA per track, teleport reset >12 m/s), ball jitter rejection (>40 m/s), trusted-ball plumbing. Live host reuses the path unchanged.
+- **back_pass**: direction-dominance gate (|dx|/dist >= 0.6), implied-speed cap 28 m/s, 8 s per-pair cooldown, discriminating confidence; verifier added a carrier-on-ball anchor gate (release/reception player must be within 5 m of the visible ball — kills arrows anchored on stale spell tids 15–25 m from the real ball, the same guard detect_triangles already had).
+- **press**: presser != carrier and >0.3 m invariant, radius 10->7 m, "high" requires a presser <= 3 m, 0.3 s persistence, distance-aware confidence.
+- **triangle**: max-side cap 22 m, compactness-scaled confidence, per-frame geometry refresh.
+- **isolation / 1v1 / NvN**: attacker != defender invariant, 0.3 s hysteresis, 8 s pair cooldown, ball-proximity confidence factor (hard drop >25 m observed ball distance), 3 s stale-geometry cap on matchup windows.
+- **formation**: per-track presence dedup (>=50% of window) + top-11 by presence, min 6 outfield to emit; block detector gains the same gate.
+- **offside_line**: segment cadence 1 s -> 2 s (geometry untouched).
+- **renderer** (`overlay.py`/`primitives.py`): event schedule with conf floor 0.35, min duration 0.4 s (back_pass/overlap/underlap exempt), 8 s per-type cooldown, 1.5 s min display so real events are legible, max 2 events on screen; ONE offside line per frame (nearest to ball, |x - ball_x| <= 30 m, 2 s team hold); drawable gate adds rmse <= 3 m, held-H age <= 2 s, >= 5 players (kills the close-up draw).
+
+### Before/after (m3 detections per minute)
+
+| type | bundesliga 0.50 min | cwc 3.01 min | Metrica 5 min clean (retention) |
+|---|---|---|---|
+| back_pass | 12.0 -> 2.0 | 6.0 -> **0.33** | 3.0 -> 2.0 (67%) |
+| isolation | 10.0 -> 4.0 | 12.3 -> 0.0 | 2.0 -> 1.2 (60%) |
+| press | 6.0 -> 2.0 | 29.5 -> 0.0* | 8.6 -> 5.6 (65%) |
+| triangle | 6.0 -> 6.0 | 0 -> 0 | 9.0 -> 5.8 (64%) |
+| 1v1 | 22.0 -> 18.0 (3 above conf floor) | 0 -> 0 | 21.8 -> 15.8 (72%) |
+| NvN family | 24.1 -> 10.0 | 0 -> 0 | 21.6 -> 8.2 (38%; 2v2 8% — 22/24 clean 2v2s are never near the ball, irreconcilable with the ball gate) |
+| formation | 24.0 -> 24.0 (labels now sane) | 15.9 -> 7.3 | unchanged |
+| offside_line | 108 -> 60 (draws 750 -> 356) | 66 -> 35 (draws 2115 -> 833) | 107 -> 58 |
+
+*cwc press 0/min is upstream recall on a phantom-ball clip: with all gates maxed loose only 3
+frames in the whole clip have 2+ opponents within 7 m of a carrier on a trusted ball; the 89
+baseline "presses" were phantom-Kalman-ball artifacts.
+
+### Blind re-grade of the regenerated videos (verifier)
+
+Every event callout actually visible in the new mp4s was graded (the scheduler makes the visible
+population a census, not a sample): bundesliga 5 scheduled events (1v1, isolation, press,
+triangle, back_pass — one each) and cwc 4 back_passes. Bundesliga: 5/5 TP. cwc: 1 TP, 3 FP —
+all three FPs were arrows whose 'from' point the real ball never visited (stale possession tids
+under heavy tracker id churn). The verifier's carrier-on-ball gate (above) removes exactly those
+three and keeps every TP; Metrica back_pass count is unchanged (10, 67% retention). Final grade
+on the shipping videos: **0 FP among all visible event callouts** (6 events across 3.5 min of
+video, vs 46 sampled FPs pre-fix). Formation: 0 labels with >10 outfield or digit-sum mismatch
+in both m3 files; the audited cwc close-up frame (t=168.3 s / frame 5049) now renders
+"[overlay off]". Offside: one line per frame, gated to ball vicinity. Live path verified:
+`bto.host.stream` 40-frame self-check and `bto.host.primitives` both pass with the smoothed
+bridge.
+
+| type | FP fraction: audit -> re-grade (visible callouts) |
+|---|---|
+| back_pass | 75% -> 0% (1 TP bundesliga + 1 TP cwc; 3 stale-tid FPs removed by the anchor gate) |
+| isolation | 87% -> 0% (1/1 TP) |
+| press | 62% -> 0% (1/1 TP) |
+| triangle | 100% -> 0% (1/1 TP) |
+| 1v1 | 80% -> 0% (1/1 TP) |
+| 2v2 family | 100% -> n/a (0 visible; all below the 0.35 confidence floor) |
+| formation | 100% -> 0 sanity violations (labels/hulls bounded, close-up draw gone) |
+| offside_line | 0% (kept accurate; draw volume halved) |
+
+Residual known limits: cwc press/isolation/1v1 recall is zero (upstream ball/tracker quality,
+out of precision scope); Metrica 2v2 retention fails the 60% bar by construction of the ball
+gate; formation labels are tracked-subset counts, not true formations.
