@@ -86,11 +86,13 @@ class _IncrementalCalib:
     fit(frame, t) / hold(t) so the live pipeline can run a real keypoint fit
     only every few frames. All math is delegated to calib.py helpers."""
 
-    def __init__(self, model, imgsz: int = 640, device: str = "cpu", kp_conf: float = 0.5):
+    def __init__(self, model, imgsz: int = 640, device: str = "cpu", kp_conf: float = 0.5,
+                 stripe_lock: bool = True):
         self.model = model
         self.imgsz = imgsz
         self.device = device
         self.kp_conf = kp_conf
+        self.stripes = _calib.StripeLock() if stripe_lock else None
         self.reset()
 
     def reset(self) -> None:
@@ -104,11 +106,32 @@ class _IncrementalCalib:
         self.pan_streak = 0
         self.last_n_kp = 0
         self.last_rmse = None
+        self.last_stripe_dx = None        # measured drift [m] (nullable)
+        self.last_stripe_app = None       # applied correction [m] (nullable)
+        self.last_stripe_strength = None  # stripe alternation score (nullable)
+        if self.stripes is not None:
+            self.stripes.reset()
 
-    def hold(self, t: float):
-        """No fit this frame: hold the last good H up to HOLD_MAX_S, else null."""
+    def _stripe_refine(self, frame_bgr) -> None:
+        """Drift mitigation (e): stripe-lock refinement of the smoothed H,
+        absorbed into the anchor state (see calib.StripeLock)."""
+        a_px = _calib._anchor_px(frame_bgr.shape[1], frame_bgr.shape[0])
+        ema_h, ema_anchor, dx, dx_app, strength = _calib._stripe_refine_anchors(
+            self.stripes, frame_bgr, self.ema_h, self.ema_anchor, a_px)
+        self.last_stripe_dx, self.last_stripe_strength = dx, strength
+        self.last_stripe_app = dx_app
+        if dx_app is not None:
+            self.ema_h, self.ema_anchor = ema_h, ema_anchor
+            self.last_held_anchor = self.ema_anchor
+
+    def hold(self, t: float, frame_bgr: np.ndarray | None = None):
+        """No fit this frame: hold the last good H up to HOLD_MAX_S, else null.
+        With stripe-lock on and a frame given, the held H is stripe-refined."""
+        self.last_stripe_dx = self.last_stripe_app = self.last_stripe_strength = None
         if self.ema_h is not None and self.last_good_t is not None \
                 and t - self.last_good_t <= _calib.HOLD_MAX_S:
+            if self.stripes is not None and frame_bgr is not None:
+                self._stripe_refine(frame_bgr)
             return self.ema_h, "held"
         self.ema_anchor = self.ema_h = None
         self.last_good_t = None
@@ -117,6 +140,7 @@ class _IncrementalCalib:
 
     def fit(self, frame_bgr: np.ndarray, t: float):
         """Run the pitch-pose model + full fit path. Returns (H|None, src)."""
+        self.last_stripe_dx = self.last_stripe_app = self.last_stripe_strength = None
         frame_h, frame_w = frame_bgr.shape[:2]
         a_px = _calib._anchor_px(frame_w, frame_h)
 
@@ -142,7 +166,7 @@ class _IncrementalCalib:
 
         if H_fit is None:
             self.last_rmse = None
-            return self.hold(t)
+            return self.hold(t, frame_bgr)
 
         if self.ema_anchor is None:
             # reseed: interpolate part-way when it disagrees with the last hold
@@ -178,6 +202,12 @@ class _IncrementalCalib:
         self.rej_anchor = None
         self.last_held_anchor = self.ema_anchor
         self.last_rmse = rmse
+        # drift mitigation (e): an accepted fit (re)anchors the stripe
+        # reference (refinement happens only on held frames, in hold() --
+        # stripes never overrule a frame that has its own fit)
+        if self.stripes is not None:
+            self.stripes.prev_dx = None  # a fit breaks any held drift streak
+            self.last_stripe_strength = self.stripes.update_reference(frame_bgr, H_fit)
         return self.ema_h, src
 
 
@@ -515,7 +545,7 @@ class StreamPipeline:
             # hold expires (HOLD_MAX_S) before the next attempt at live cadence.
             self._since_fit = 0 if calib_src in ("fit", "ema") else self.calib_every - 1
         else:
-            H, calib_src = self.calib.hold(t)
+            H, calib_src = self.calib.hold(t, frame_bgr)
             self._since_fit += 1
         self.stage_ms["calib"] += (time.perf_counter() - t0) * 1e3
 
@@ -576,6 +606,9 @@ class StreamPipeline:
                 "total_ms": total_ms,
                 "n_kp": self.calib.last_n_kp,
                 "rmse_m": self.calib.last_rmse,
+                "stripe_dx": self.calib.last_stripe_dx,
+                "stripe_dx_applied": self.calib.last_stripe_app,
+                "stripe_strength": self.calib.last_stripe_strength,
                 "teams_ready": self.teams.ready,
                 "ball_px": ball_px,
                 "buffer_len": len(self._buffer),
@@ -625,15 +658,37 @@ def _self_check() -> None:
     assert first_h is not None and first_h < 5, f"H first arrived at frame {first_h}"
     held = [i for i, r in enumerate(results) if r["calib_src"] == "held"]
     assert held, "expected held frames between fits (calib_every=5)"
+    a_px = _calib._anchor_px(1280, 720)  # cwc clip is 1280x720
     for i in held:
         # a held frame's H must be EXACTLY the previous frame's H (no refit)
+        # -- up to the stripe-lock x-correction, when one was applied.
         assert results[i - 1]["H"] is not None
-        assert np.array_equal(results[i]["H"], results[i - 1]["H"]), \
-            f"held frame {i} changed H"
+        app = results[i]["timings"]["stripe_dx_applied"] or 0.0
+        if app == 0.0:
+            assert np.array_equal(results[i]["H"], results[i - 1]["H"]), \
+                f"held frame {i} changed H without a stripe correction"
+        else:
+            # H_i must equal T(app) @ H_{i-1}: anchor projections shift by
+            # exactly (app, 0)
+            d = (_calib.project(np.asarray(results[i]["H"]), a_px)
+                 - _calib.project(np.asarray(results[i - 1]["H"]), a_px)
+                 - np.array([app, 0.0]))
+            assert float(np.abs(d).max()) < 1e-3, \
+                f"held frame {i} stripe correction is not a pure x-shift"
     srcs = {s: sum(1 for r in results if r["calib_src"] == s)
             for s in ("fit", "ema", "held", "null")}
     print(f"[self-check] H first at frame {first_h}; calib_src breakdown: {srcs} "
-          f"(held frames verified identical to their fit)")
+          f"(held frames verified identical to their fit up to stripe dx)")
+    s_strength = [r["timings"]["stripe_strength"] for r in results
+                  if r["shot"] == "main" and r["timings"].get("stripe_strength") is not None]
+    s_dx = [r["timings"]["stripe_dx"] for r in results
+            if r["shot"] == "main" and r["timings"].get("stripe_dx") is not None]
+    print(f"[self-check] stripe extras: strength on {len(s_strength)} frames "
+          f"(median {np.median(s_strength):.3f})" if s_strength else
+          "[self-check] stripe extras: strength never measurable")
+    if s_dx:
+        print(f"[self-check] stripe dx measured on {len(s_dx)} frames "
+              f"(median {np.median(np.abs(s_dx)):.3f} m abs)")
 
     # teams warmup completes or is progressing
     if pipe.teams.ready:

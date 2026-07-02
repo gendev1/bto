@@ -57,6 +57,10 @@ Drift mitigations (SPEC S9), all three, plus an M4 pan-lag tune (d):
         contract) only moves RESEED_INTERP_ALPHA of the way there, primed with
         an elevated pan streak so the next 1-2 "ema" frames (via the adaptive
         alpha in (a)) finish closing the gap instead of a hard cut.
+    (e) stripe-lock (StripeLock class below, M5.x): the pitch's mowing
+        stripes are used as a temporal x-drift anchor between keypoint fits.
+        Adds nullable "stripe_dx" / "stripe_strength" fields to each
+        calib.jsonl row; disable with calibrate(..., stripe_lock=False).
 """
 
 from __future__ import annotations
@@ -200,6 +204,292 @@ def _frame_keypoints(result, kp_conf: float):
 
 
 # ---------------------------------------------------------------------------
+# StripeLock: mowing-stripe temporal x-drift anchor (drift mitigation (e))
+# ---------------------------------------------------------------------------
+# Mowing stripes (dark/light green bands parallel to the goal line, i.e.
+# constant-x bands of the 105x68 frame) are FIXED in the world. If the current
+# H maps a stripe edge to a sliding pitch-x during a camera pan, that slide IS
+# calibration drift -- measurable and correctable. Stripes cannot give
+# absolute position (widths are not standardized): the reference profile is
+# (re)anchored on frames with an accepted RAW keypoint fit (absolute truth)
+# and only holds x steady between/against the smoothed outputs.
+#
+# Per-frame use (causal, live-safe):
+#   * anchored frames (an accepted raw fit exists, src 'fit'/'ema'):
+#     update_reference(frame, H_fit_raw).
+#   * HELD frames only (no accepted fit this frame): refine(frame, H_out)
+#     cross-correlates the current profile against the reference over
+#     dx in +-STRIPE_MAX_SHIFT_M; _stripe_refine_anchors() then absorbs the
+#     damped, capped correction H' = T(dx_applied) @ H into the anchor-space
+#     EMA state so the next frame does not fight it.
+#     Refining 'ema' frames too was tried and measured (cwc2021, per-frame
+#     raw fits as truth): the EMA already tracks fits to 0.06 m median in x,
+#     while the stripe dx measurement carries 0.3-0.5 m noise/bias episodes
+#     -- 23 of 31 fired corrections moved x AWAY from the fit. Stripes hold
+#     x steady BETWEEN fits; they never overrule a frame that has one.
+#
+# Telemetry ("stripe_dx"/"stripe_strength", both nullable): stripe_dx is the
+# MEASURED drift [m] (the applied correction is STRIPE_DAMP * clip(dx,
+# +-STRIPE_DX_CAP_M) and only fires when |dx| >= STRIPE_DEADBAND_M, so
+# fit-noise-level jitter is not fed back); stripe_strength is the stripe
+# ALTERNATION score: max anti-correlation of the detrended profile with
+# itself over half-period lags 2-8 m (periods ~4-16 m), scaled down when the
+# detrended amplitude is tiny. Alternating bands anti-correlate strongly at
+# half period; noise and smooth (shadow/vignette) variation do not. Below
+# STRIPE_STRENGTH_MIN the whole feature is a silent no-op (plain pitches,
+# heavy shadow, motion blur).
+#
+# Robustness (measured on cwc2021 FIFA+ 720p / bundesliga 1080p): the raw
+# profile is polluted by non-pitch pixels that pass the in-frame bounds check
+# (broadcast overlay panels sample 0/255 spikes) and by players/kits,
+# drowning a +-4 gray-level stripe signal. Hence (1) a per-sample grass
+# chroma mask (G dominant over B and not far below R), (2) MEDIAN aggregation
+# across the y rows instead of mean, and (3) winsorizing the detrended
+# profile at 3x its median |value| (white pitch-line spikes and player
+# residue otherwise dominate the L2 correlations: on cwc frame 495 the
+# half-period dip is -0.16 raw vs -0.49 winsorized). Surviving line spikes
+# are harmless -- they are world-fixed, i.e. legitimate x-alignment signal.
+
+STRIPE_STEP_M = 0.25          # x sampling step of the pitch-space profile
+STRIPE_Y_ROWS = tuple(float(y) for y in range(14, 55, 4))  # central band
+STRIPE_MIN_ROWS = 3           # min valid y samples per x cell
+STRIPE_BASELINE_M = 8.0       # detrend box-filter width
+STRIPE_HALFP_M = (2.0, 8.0)   # half-period lag range for the alternation dip
+STRIPE_WINSOR_K = 3.0         # winsorize detrended profile at K * median|d|
+STRIPE_AMP_MIN = 1.0          # full-credit rms amplitude [gray levels]
+STRIPE_STRENGTH_MIN = 0.30    # min strength to trust the stripes at all
+STRIPE_MIN_OVERLAP_M = 15.0   # min x-overlap for detrend/strength/correlation
+STRIPE_MAX_SHIFT_M = 2.0      # correlation search window
+STRIPE_PROM_MARGIN = 0.10     # peak must beat rivals > 1 m away by this
+STRIPE_DEADBAND_M = 0.35      # |dx| below this: measure but do not correct
+STRIPE_DX_CAP_M = 1.5         # max |dx| fed into the correction
+STRIPE_DAMP = 0.7             # damping on the applied correction
+STRIPE_REF_BLEND = 0.5        # blend of a new anchored profile into the ref
+
+_STRIPE_N_X = int(round(105.0 / STRIPE_STEP_M)) + 1          # 421 cells
+_STRIPE_MIN_CELLS = int(round(STRIPE_MIN_OVERLAP_M / STRIPE_STEP_M))  # 60
+
+
+class StripeLock:
+    """1-D pitch-x luminance profile matcher. All methods are per-frame and
+    causal; every failure path degrades to a silent no-op."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self.ref: np.ndarray | None = None  # (_STRIPE_N_X,) detrended, NaN=unknown
+        self.prev_dx: float | None = None   # previous refine() measurement
+
+    # -- profile extraction ---------------------------------------------------
+
+    def _profile(self, frame_bgr: np.ndarray, H) -> tuple[np.ndarray | None, float | None]:
+        """Detrended stripe profile p(x) over the visible pitch (NaN where not
+        visible/sampled) + stripe_strength. (None, None) if not measurable."""
+        h, w = frame_bgr.shape[:2]
+        Hm = np.asarray(H, dtype=np.float64).reshape(3, 3)
+        try:
+            Hinv = np.linalg.inv(Hm)
+        except np.linalg.LinAlgError:
+            return None, None
+        # in-front-of-camera sign: weight of a surely-on-pitch pixel (bottom center)
+        bc_w = float((Hm @ np.array([w / 2.0, h - 1.0, 1.0]))[2])
+        if abs(bc_w) < 1e-12:
+            return None, None
+        sgn = 1.0 if bc_w > 0 else -1.0
+
+        xs = np.arange(_STRIPE_N_X) * STRIPE_STEP_M
+        ys = np.asarray(STRIPE_Y_ROWS)
+        X, Y = np.meshgrid(xs, ys)                      # (R, N)
+        pts = np.stack([X, Y, np.ones_like(X)])         # (3, R, N)
+        q = np.tensordot(Hinv, pts, axes=1)             # (3, R, N)
+        den = q[2]
+        ok = sgn * den > 1e-9
+        safe = np.where(ok, den, 1.0)
+        u = q[0] / safe
+        v = q[1] / safe
+        ok &= (u >= 0.0) & (u <= w - 1.001) & (v >= 0.0) & (v <= h - 1.001)
+        if not ok.any():
+            return None, None
+
+        u = np.where(ok, u, 0.0)
+        v = np.where(ok, v, 0.0)
+        u0 = np.floor(u).astype(np.intp)
+        v0 = np.floor(v).astype(np.intp)
+        fu, fv = u - u0, v - v0
+        w00, w10 = (1 - fu) * (1 - fv), fu * (1 - fv)
+        w01, w11 = (1 - fu) * fv, fu * fv
+
+        def _bilinear(ch: np.ndarray) -> np.ndarray:
+            # gather-then-convert: only the sampled pixels leave uint8
+            return (w00 * ch[v0, u0] + w10 * ch[v0, u0 + 1]
+                    + w01 * ch[v0 + 1, u0] + w11 * ch[v0 + 1, u0 + 1])
+
+        bv = _bilinear(frame_bgr[:, :, 0])
+        gv = _bilinear(frame_bgr[:, :, 1])
+        rv = _bilinear(frame_bgr[:, :, 2])
+        # grass chroma mask: overlay graphics / white kits (G ~ B) and warm
+        # colors (R >> G) pass the bounds check but are not pitch surface
+        ok &= (gv >= bv + 8.0) & (rv <= gv + 12.0)
+
+        cnt = ok.sum(axis=0)
+        vals = np.where(ok, gv, np.nan)
+        p = np.full(_STRIPE_N_X, np.nan)
+        cols = cnt >= STRIPE_MIN_ROWS
+        if not cols.any():
+            return None, None
+        p[cols] = np.nanmedian(vals[:, cols], axis=0)    # robust to players
+
+        m = np.isfinite(p)
+        if int(m.sum()) < _STRIPE_MIN_CELLS:
+            return None, None
+        # detrend: subtract a heavily-smoothed (normalized box) baseline
+        win = int(round(STRIPE_BASELINE_M / STRIPE_STEP_M)) | 1
+        k = np.ones(win)
+        base_n = np.convolve(np.where(m, p, 0.0), k, "same")
+        base_c = np.convolve(m.astype(np.float64), k, "same")
+        base = base_n / np.maximum(base_c, 1.0)
+        d = np.where(m & (base_c >= win * 0.5), p - base, np.nan)
+        if int(np.isfinite(d).sum()) < _STRIPE_MIN_CELLS:
+            return None, None
+        # winsorize: line spikes / player residue otherwise dominate the
+        # L2 correlations (see module comment)
+        lim = STRIPE_WINSOR_K * float(np.nanmedian(np.abs(d)))
+        if lim > 1e-9:
+            d = np.clip(d, -lim, lim)
+        return d, self._strength(d)
+
+    @staticmethod
+    def _strength(d: np.ndarray) -> float | None:
+        """Stripe alternation score: max ANTI-correlation of the detrended
+        profile with itself over half-period lags (STRIPE_HALFP_M), scaled by
+        amplitude credit (rms of the detrended profile vs STRIPE_AMP_MIN)."""
+        valid = np.isfinite(d)
+        vals = d[valid]
+        if len(vals) < _STRIPE_MIN_CELLS:
+            return None
+        amp = float(np.sqrt((vals ** 2).mean()))
+        lo = int(round(STRIPE_HALFP_M[0] / STRIPE_STEP_M))
+        hi = int(round(STRIPE_HALFP_M[1] / STRIPE_STEP_M))
+        dip = 0.0
+        for lag in range(lo, hi + 1):
+            a, b = d[:-lag], d[lag:]
+            m2 = np.isfinite(a) & np.isfinite(b)
+            if int(m2.sum()) < 40:
+                continue
+            aa, bb = a[m2] - a[m2].mean(), b[m2] - b[m2].mean()
+            denom = float(np.sqrt((aa ** 2).sum() * (bb ** 2).sum()))
+            if denom < 1e-9:
+                continue
+            dip = max(dip, float(-(aa * bb).sum() / denom))
+        return dip * min(1.0, amp / STRIPE_AMP_MIN)
+
+    # -- reference anchoring / refinement --------------------------------------
+
+    def update_reference(self, frame_bgr: np.ndarray, H_fit_raw) -> float | None:
+        """Anchor/refresh the reference profile from a frame whose RAW keypoint
+        fit passed the gate (absolute truth). Returns stripe_strength."""
+        d, strength = self._profile(frame_bgr, H_fit_raw)
+        if d is None or strength is None or strength < STRIPE_STRENGTH_MIN:
+            return strength
+        if self.ref is None:
+            self.ref = d
+        else:
+            newm, refm = np.isfinite(d), np.isfinite(self.ref)
+            both = newm & refm
+            out = np.where(refm, self.ref, np.nan)
+            out[newm] = d[newm]
+            out[both] = ((1.0 - STRIPE_REF_BLEND) * self.ref[both]
+                         + STRIPE_REF_BLEND * d[both])
+            self.ref = out
+        return strength
+
+    def refine(self, frame_bgr: np.ndarray, H) -> tuple[float | None, float | None]:
+        """Measure the x-drift of H against the reference. Returns
+        (dx_measured_m | None, stripe_strength | None): applying T(dx) @ H
+        (T = [[1,0,dx],[0,1,0],[0,0,1]]) moves the mapped stripe x's back onto
+        the reference. None dx = no confident measurement (no-op)."""
+        d, strength = self._profile(frame_bgr, H)
+        if (d is None or strength is None or strength < STRIPE_STRENGTH_MIN
+                or self.ref is None):
+            return None, strength
+
+        smax = int(round(STRIPE_MAX_SHIFT_M / STRIPE_STEP_M))
+        n = _STRIPE_N_X
+        scores = np.full(2 * smax + 1, np.nan)
+        for i, sft in enumerate(range(-smax, smax + 1)):
+            # drift e satisfies cur(x) = ref(x - e): score(sft) matches
+            # ref(x) against cur(x + sft), peaking at sft = e.
+            if sft >= 0:
+                a, b = self.ref[:n - sft], d[sft:]
+            else:
+                a, b = self.ref[-sft:], d[:n + sft]
+            m2 = np.isfinite(a) & np.isfinite(b)
+            if int(m2.sum()) < _STRIPE_MIN_CELLS:
+                continue
+            aa, bb = a[m2] - a[m2].mean(), b[m2] - b[m2].mean()
+            denom = float(np.sqrt((aa ** 2).sum() * (bb ** 2).sum()))
+            if denom < 1e-9:
+                continue
+            scores[i] = float((aa * bb).sum() / denom)
+
+        if not np.isfinite(scores).any():
+            return None, strength
+        bi = int(np.nanargmax(scores))
+        if bi == 0 or bi == len(scores) - 1:      # peak at the search border
+            return None, strength
+        best = scores[bi]
+        # prominence: any rival > 1 m away within the margin -> ambiguous
+        for j in range(len(scores)):
+            if abs(j - bi) > 4 and np.isfinite(scores[j]) \
+                    and scores[j] > best - STRIPE_PROM_MARGIN:
+                return None, strength
+        # sub-cell parabolic refinement
+        c0, c1, c2 = scores[bi - 1], scores[bi], scores[bi + 1]
+        delta = 0.0
+        if np.isfinite(c0) and np.isfinite(c2):
+            denom = c0 - 2.0 * c1 + c2
+            if abs(denom) > 1e-9:
+                delta = float(np.clip(0.5 * (c0 - c2) / denom, -0.5, 0.5))
+        e = (bi - smax + delta) * STRIPE_STEP_M
+        dx = -e
+        if abs(dx) > STRIPE_MAX_SHIFT_M:
+            return None, strength
+        return float(dx), strength
+
+
+def _stripe_refine_anchors(stripes: StripeLock, frame_bgr: np.ndarray,
+                           ema_h: np.ndarray, ema_anchor: np.ndarray,
+                           a_px: np.ndarray):
+    """Measure the stripe x-drift of the smoothed output H and absorb the
+    damped, capped correction into the anchor-space EMA state (equivalent to
+    H' = T(dx_applied) @ H, since the 4 anchors define H exactly). Returns
+    (ema_h, ema_anchor, dx_measured | None, dx_applied | None,
+    stripe_strength | None); dx_applied is None when no correction fired.
+
+    A correction only fires when TWO CONSECUTIVE measurements agree in sign
+    and both exceed the deadband (same philosophy as the pan detector in
+    (a)): single-frame dx measurement noise (sigma ~0.3-0.5 m from reference
+    phase jitter + sub-cell peak localization, measured on cwc2021 against
+    per-frame raw fits) must not be fed back, while real drift -- a held H
+    during camera motion, a stale hold after a cut -- keeps measuring the
+    same sign every frame and passes."""
+    dx, strength = stripes.refine(frame_bgr, ema_h)
+    prev = stripes.prev_dx
+    stripes.prev_dx = dx
+    if (dx is None or abs(dx) < STRIPE_DEADBAND_M
+            or prev is None or abs(prev) < STRIPE_DEADBAND_M or prev * dx <= 0):
+        return ema_h, ema_anchor, dx, None, strength
+    dx_app = STRIPE_DAMP * float(np.clip(dx, -STRIPE_DX_CAP_M, STRIPE_DX_CAP_M))
+    ema_anchor = ema_anchor + np.array([dx_app, 0.0])
+    ema_h = _h_from_anchors(a_px, ema_anchor)
+    # a correction moves the output onto the reference: restart the streak so
+    # the NEXT independent drift measurement must re-qualify
+    stripes.prev_dx = None
+    return ema_h, ema_anchor, dx, dx_app, strength
+
+
+# ---------------------------------------------------------------------------
 # main entry point
 # ---------------------------------------------------------------------------
 
@@ -230,6 +520,8 @@ def calibrate(
     kp_conf: float = 0.5,
     model_path: str = DEFAULT_MODEL,
     max_frames: int | None = None,
+    stripe_lock: bool = True,
+    _kp_cache: str | None = None,
 ) -> str:
     """Run pitch calibration over `video_path`, writing calib.jsonl.
 
@@ -237,6 +529,12 @@ def calibrate(
     processed and written; all frames are treated as main when it is None.
     frame_idx indexes the ORIGINAL video, t = frame_idx / fps. `max_frames`
     caps the number of PROCESSED (main) frames. Returns the output path.
+
+    stripe_lock: enable drift mitigation (e) (StripeLock; silent no-op on
+    pitches without visible mowing stripes). _kp_cache: internal A/B-testing
+    hook -- path to a keypoint-cache jsonl; if the file exists the pose model
+    is not loaded and per-frame keypoints are read from it, otherwise the
+    model runs normally and the cache is written alongside.
     """
     from ultralytics import YOLO
 
@@ -255,8 +553,26 @@ def calibrate(
     else:
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
-    model = YOLO(model_path)
+    kp_cache_data: dict | None = None
+    kp_cache_f = None
+    model = None
+    if _kp_cache is not None and os.path.exists(_kp_cache):
+        kp_cache_data = {}
+        with open(_kp_cache) as cf:
+            for line in cf:
+                if line.strip():
+                    r = json.loads(line)
+                    kp_cache_data[int(r["frame_idx"])] = (
+                        np.array(r["kp_px"], dtype=np.float64).reshape(-1, 2),
+                        np.array(r["kp_m"], dtype=np.float64).reshape(-1, 2),
+                    )
+    else:
+        model = YOLO(model_path)
+        if _kp_cache is not None:
+            kp_cache_f = open(_kp_cache, "w")
     shot_labels = _load_shot_labels(shots_jsonl) if shots_jsonl else None
+    stripes = StripeLock() if stripe_lock else None
+    stripe_ms_total, stripe_n, stripe_n_corr = 0.0, 0, 0
 
     ema_anchor: np.ndarray | None = None  # (4,2) smoothed anchor projections [m]
     ema_h: np.ndarray | None = None       # H through the smoothed anchors (last good H)
@@ -296,11 +612,23 @@ def calibrate(
                     last_good_t = None
                     last_held_anchor = None
                     prev_resid, prev_resid_mag, pan_streak = None, 0.0, 0
+                    if stripes is not None:
+                        stripes.reset()
                 prev_main_idx = frame_idx
 
                 t_frame = time.time()
-                result = model(frame, imgsz=imgsz, device=dev, verbose=False)[0]
-                kp_px, kp_m = _frame_keypoints(result, kp_conf)
+                if kp_cache_data is not None:
+                    kp_px, kp_m = kp_cache_data.get(
+                        frame_idx, (np.empty((0, 2)), np.empty((0, 2))))
+                else:
+                    result = model(frame, imgsz=imgsz, device=dev, verbose=False)[0]
+                    kp_px, kp_m = _frame_keypoints(result, kp_conf)
+                    if kp_cache_f is not None:
+                        kp_cache_f.write(json.dumps({
+                            "frame_idx": frame_idx,
+                            "kp_px": kp_px.tolist(),
+                            "kp_m": kp_m.tolist(),
+                        }) + "\n")
                 n_kp = len(kp_px)
 
                 H_fit, rmse = _fit_homography(kp_px, kp_m)
@@ -364,6 +692,29 @@ def calibrate(
                         # last_held_anchor deliberately NOT cleared here: it
                         # is the reseed's comparison point in (d) above.
 
+                # (e) stripe-lock: refine smoothed/held output frames against
+                # the reference, then (re)anchor the reference on frames with
+                # an accepted RAW fit. Absorbed into the EMA anchors so the
+                # next frame does not fight the correction.
+                stripe_dx = stripe_strength = None
+                if stripes is not None and H_out is not None:
+                    t_stripe = time.time()
+                    if src == "held" and ema_anchor is not None:
+                        ema_h, ema_anchor, stripe_dx, dx_app, stripe_strength = \
+                            _stripe_refine_anchors(stripes, frame, ema_h,
+                                                   ema_anchor, a_px)
+                        if dx_app is not None:
+                            last_held_anchor = ema_anchor
+                            H_out = ema_h
+                            stripe_n_corr += 1
+                    if H_fit is not None:
+                        stripes.prev_dx = None  # a fit breaks the drift streak
+                        s = stripes.update_reference(frame, H_fit)
+                        if stripe_strength is None:
+                            stripe_strength = s
+                    stripe_ms_total += (time.time() - t_stripe) * 1e3
+                    stripe_n += 1
+
                 rec = {
                     "frame_idx": frame_idx,
                     "t": t,
@@ -371,6 +722,8 @@ def calibrate(
                     "n_kp": int(n_kp),
                     "rmse_m": rmse_out,
                     "src": src,
+                    "stripe_dx": stripe_dx,
+                    "stripe_strength": stripe_strength,
                 }
                 f.write(json.dumps(rec) + "\n")
                 n_written += 1
@@ -385,9 +738,14 @@ def calibrate(
             frame_idx += 1
 
     cap.release()
+    if kp_cache_f is not None:
+        kp_cache_f.close()
     elapsed = time.time() - t0
     print(f"[calib] done: {n_written} main frames in {elapsed:.1f}s "
           f"({n_written / max(elapsed, 1e-9):.2f} fps) -> {out_path}")
+    if stripes is not None and stripe_n:
+        print(f"[calib] stripe-lock: {stripe_ms_total / stripe_n:.2f} ms/frame "
+              f"avg over {stripe_n} frames, {stripe_n_corr} corrections applied")
     return out_path
 
 
@@ -464,6 +822,8 @@ def main() -> None:
     ap.add_argument("--kp-conf", type=float, default=0.5)
     ap.add_argument("--max-frames", type=int, default=None)
     ap.add_argument("--out", default=None, help="output directory (writes calib.jsonl inside it)")
+    ap.add_argument("--no-stripe-lock", action="store_true",
+                    help="disable the mowing-stripe x-drift anchor (mitigation (e))")
     ap.add_argument("--self-check", action="store_true")
     args = ap.parse_args()
 
@@ -484,6 +844,7 @@ def main() -> None:
         kp_conf=args.kp_conf,
         model_path=args.model,
         max_frames=args.max_frames,
+        stripe_lock=not args.no_stripe_lock,
     )
 
 
