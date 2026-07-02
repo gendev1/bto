@@ -347,3 +347,8 @@ back_pass/isolation, ~4 ms) every tick, relational Detections reused in between
 - detect_pressing's >=2-concurrent-pressers gate on top of edges' 0.6 s
   sustained-closing birth drops Metrica press episodes 14 -> 1 per 5 min
   (edges themselves found 18); worth revisiting the concurrency floor.
+
+**M6 follow-up (tid regression diagnosed):** the per-frame-index tids in the regenerated cwc
+`detections.jsonl` were a one-off artifact of an interrupted regeneration run, not a live code bug —
+a fresh 30-frame detect run shows healthy ByteTrack persistence (16/18 tids ≥5 frames). No action
+needed: `bridge._retrack` makes downstream indifferent to upstream tid quality either way.
