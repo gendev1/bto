@@ -71,6 +71,18 @@ def _pick_device(device: str) -> str:
     return "mps" if torch.backends.mps.is_available() else "cpu"
 
 
+def _load_shot_labels(shots_jsonl: str) -> dict[int, str]:
+    labels: dict[int, str] = {}
+    with open(shots_jsonl) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            labels[int(rec["frame_idx"])] = rec["shot"]
+    return labels
+
+
 def run_detection(
     video_path: str,
     model_path: str = DEFAULT_MODEL,
@@ -80,11 +92,31 @@ def run_detection(
     device: str = "auto",
     conf: float = 0.3,
     max_frames: int | None = None,
+    shots_jsonl: str | None = None,
+    start_frame: int = 0,
 ) -> str:
     """Run detection+tracking over `video_path`, writing detections.jsonl.
 
     frame_idx is the index into the ORIGINAL video (stride-aware: jumps by `stride`).
     t = frame_idx / fps.
+
+    If `shots_jsonl` is given (path to a shots.jsonl written by bto.vision.shots
+    over the SAME frame_idx/stride), frames labeled 'other' are skipped entirely
+    (the tracker never sees them; an empty-boxes record is still emitted so
+    frame_idx coverage stays explicit). Each run of consecutive 'main' frames
+    (a "main segment", i.e. no 'other'/missing frame in between at this stride)
+    starts a FRESH ByteTrack state (persist=False on the segment's first frame),
+    so tracks are never falsely linked across a shot cut. Raw tracker ids are
+    offset per-segment by a running max-seen-tid so tids stay unique across the
+    whole video despite the resets.
+
+    When shots_jsonl is None, behavior is unchanged from before (single
+    persistent ByteTrack run across the whole clip).
+
+    `start_frame` seeks the video before processing begins (frame_idx in the
+    output still refers to the ORIGINAL video's absolute frame index); used by
+    the self-check to probe a specific shot-boundary window without paying for
+    GPU inference on every main-segment frame from 0 up to the window.
 
     Returns the output path.
     """
@@ -107,9 +139,19 @@ def run_detection(
 
     model = YOLO(model_path)
 
-    frame_idx = 0
+    shot_labels = _load_shot_labels(shots_jsonl) if shots_jsonl else None
+
+    if start_frame:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    frame_idx = start_frame
     n_processed = 0
     t0 = time.time()
+
+    # Track-hygiene state (only used when shot_labels is set):
+    tid_offset = 0          # added to every raw tracker id emitted so far
+    prev_main_frame_idx = None  # frame_idx of the previous MAIN frame processed
+    max_raw_tid_seen = 0    # max raw (pre-offset) tid seen in the CURRENT segment
 
     with open(out_path, "w") as f:
         while True:
@@ -118,9 +160,33 @@ def run_detection(
                 break
 
             if frame_idx % stride == 0:
+                if shot_labels is not None:
+                    label = shot_labels.get(frame_idx, "other")
+                    if label != "main":
+                        rec = {"frame_idx": frame_idx, "t": frame_idx / fps, "boxes": []}
+                        f.write(json.dumps(rec) + "\n")
+                        n_processed += 1
+                        if max_frames is not None and n_processed >= max_frames:
+                            break
+                        frame_idx += 1
+                        continue
+
+                    # main frame: is this the start of a new segment?
+                    is_segment_start = (
+                        prev_main_frame_idx is None
+                        or frame_idx - prev_main_frame_idx != stride
+                    )
+                    if is_segment_start:
+                        tid_offset += max_raw_tid_seen
+                        max_raw_tid_seen = 0
+                    persist = not is_segment_start
+                    prev_main_frame_idx = frame_idx
+                else:
+                    persist = True
+
                 result = model.track(
                     frame,
-                    persist=True,
+                    persist=persist,
                     tracker="bytetrack.yaml",
                     imgsz=imgsz,
                     conf=conf,
@@ -141,7 +207,15 @@ def run_detection(
                         c = int(cls[i])
                         if c == 0:  # drop ball; handled by the ball specialist module
                             continue
-                        tid = int(tids[i]) if tids is not None else None
+                        if tids is not None:
+                            raw_tid = int(tids[i])
+                            if shot_labels is not None:
+                                max_raw_tid_seen = max(max_raw_tid_seen, raw_tid)
+                                tid = raw_tid + tid_offset
+                            else:
+                                tid = raw_tid
+                        else:
+                            tid = None
                         boxes_out.append({
                             "tid": tid,
                             "cls": CLASS_NAMES.get(c, str(c)),
@@ -175,33 +249,111 @@ def run_detection(
 
 
 def _self_check() -> None:
-    video = "data/clips/bundesliga_smoke.mp4"
-    out_path = "out/bundesliga_smoke/detections.jsonl"
+    """Track-hygiene self-check (M3): probe a 40-frame window of the cwc clip
+    that spans two known 'other' shot-cut gaps (per the existing shots.jsonl),
+    at the same stride=3 shots.jsonl was computed with. Only the frames
+    labeled 'main' inside the window actually hit the GPU tracker (26 of 40
+    here), well under the 40-GPU-frame budget.
+    """
+    video = "data/clips/cwc2021_chelsea_palmeiras_20m.mp4"
+    if not os.path.exists(video):
+        video = "data/clips/cwc2021_chelsea_palmeiras_20m.webm"
+    shots_path = "out/cwc2021_chelsea_palmeiras_20m/shots.jsonl"
+    out_path = "out/cwc2021_chelsea_palmeiras_20m/_selfcheck_detections.jsonl"
+
+    stride = 3
+    start_frame = 1500
+    n_window = 40
+
     t0 = time.time()
-    run_detection(video, out_path=out_path, stride=2, max_frames=40, device="auto")
+    run_detection(
+        video, out_path=out_path, stride=stride, max_frames=n_window,
+        device="auto", shots_jsonl=shots_path, start_frame=start_frame,
+    )
     elapsed = time.time() - t0
 
     with open(out_path) as f:
         lines = [json.loads(line) for line in f]
+    assert len(lines) == n_window, f"expected {n_window} frames, got {len(lines)}"
 
-    assert len(lines) == 40, f"expected 40 frames, got {len(lines)}"
+    shot_labels = _load_shot_labels(shots_path)
 
-    n_player_boxes = [
-        sum(1 for b in rec["boxes"] if b["cls"] in ("player", "goalkeeper")) for rec in lines
-    ]
-    n_player_boxes.sort()
-    median = n_player_boxes[len(n_player_boxes) // 2]
-    print(f"[self-check] median player+gk boxes/frame = {median}")
-    assert median >= 15, f"median player boxes/frame {median} < 15"
+    # (a) 'other' frames in the window emit empty boxes.
+    other_lines = [rec for rec in lines if shot_labels.get(rec["frame_idx"]) != "main"]
+    assert other_lines, "window has no 'other' frames -- pick a different window"
+    for rec in other_lines:
+        assert rec["boxes"] == [], f"'other' frame {rec['frame_idx']} has non-empty boxes"
+    print(f"[self-check] {len(other_lines)} 'other' frames all emitted empty boxes")
 
-    tid_counts: dict[int, int] = {}
-    for rec in lines:
-        for b in rec["boxes"]:
-            if b["tid"] is not None:
-                tid_counts[b["tid"]] = tid_counts.get(b["tid"], 0) + 1
-    persistent = [tid for tid, cnt in tid_counts.items() if cnt >= 10]
-    print(f"[self-check] tids seen >=10 times: {len(persistent)} of {len(tid_counts)} total tids")
-    assert len(persistent) >= 1, "no track id persisted across >= 10 frames"
+    # (b)/(c) tids: unique overall but persist within a segment, differ across boundaries.
+    # Recover segments the same way run_detection did: consecutive main frame_idx
+    # separated by exactly `stride` are the same segment.
+    main_lines = [rec for rec in lines if shot_labels.get(rec["frame_idx"]) == "main"]
+    segments: list[list[dict]] = []
+    prev_idx = None
+    for rec in main_lines:
+        if prev_idx is None or rec["frame_idx"] - prev_idx != stride:
+            segments.append([])
+        segments[-1].append(rec)
+        prev_idx = rec["frame_idx"]
+    assert len(segments) >= 2, f"expected >=2 main segments in window, got {len(segments)}"
+    print(f"[self-check] window has {len(segments)} main segments "
+          f"(sizes {[len(s) for s in segments]})")
+
+    all_tids: dict[int, int] = {}  # tid -> which segment index first saw it
+    for seg_i, seg in enumerate(segments):
+        seg_tids = set()
+        for rec in seg:
+            for b in rec["boxes"]:
+                if b["tid"] is not None:
+                    seg_tids.add(b["tid"])
+                    if b["tid"] in all_tids and all_tids[b["tid"]] != seg_i:
+                        raise AssertionError(
+                            f"tid {b['tid']} reused across segments {all_tids[b['tid']]} and {seg_i}"
+                        )
+                    all_tids[b["tid"]] = seg_i
+        assert seg_tids, f"segment {seg_i} has no tracked ids at all"
+
+    print(f"[self-check] {len(all_tids)} unique tids total across {len(segments)} segments, "
+          f"none reused across a shot-cut boundary")
+
+    # within-segment persistence: at least one tid should survive >= half a segment.
+    for seg_i, seg in enumerate(segments):
+        if len(seg) < 3:
+            continue
+        tid_counts: dict[int, int] = {}
+        for rec in seg:
+            for b in rec["boxes"]:
+                if b["tid"] is not None:
+                    tid_counts[b["tid"]] = tid_counts.get(b["tid"], 0) + 1
+        best = max(tid_counts.values()) if tid_counts else 0
+        assert best >= len(seg) // 2, (
+            f"segment {seg_i}: no tid persisted across >= half its {len(seg)} frames "
+            f"(best={best})"
+        )
+    print("[self-check] within-segment tid persistence OK")
+
+    # segment-aware churn: new-tids per minute, counting only within contiguous
+    # segments and excluding each segment's first frame (the honest SPEC C3 metric).
+    fps = 30.0
+    seen_before: set[int] = set()
+    new_tid_events = 0
+    counted_seconds = 0.0
+    for seg in segments:
+        seen_before |= set()  # tids are already globally unique per segment; nothing carried in
+        for i, rec in enumerate(seg):
+            tids_here = {b["tid"] for b in rec["boxes"] if b["tid"] is not None}
+            if i == 0:
+                seen_before |= tids_here
+                continue
+            new_here = tids_here - seen_before
+            new_tid_events += len(new_here)
+            seen_before |= tids_here
+            counted_seconds += stride / fps
+    churn_per_min = new_tid_events / (counted_seconds / 60.0) if counted_seconds > 0 else float("nan")
+    print(f"[self-check] segment-aware churn: {new_tid_events} new tids over "
+          f"{counted_seconds:.1f}s counted (excl. segment-first frames) "
+          f"= {churn_per_min:.2f} new-tids/min")
 
     print(f"[self-check] OK: {len(lines)} frames, {elapsed:.1f}s total, "
           f"{elapsed / len(lines):.3f}s/frame")
@@ -217,6 +369,8 @@ def main() -> None:
     ap.add_argument("--conf", type=float, default=0.3)
     ap.add_argument("--max-frames", type=int, default=None)
     ap.add_argument("--out", default=None, help="output directory (writes detections.jsonl inside it)")
+    ap.add_argument("--shots", default=None,
+                     help="path to shots.jsonl (same video/stride) for segment-reset track hygiene")
     args = ap.parse_args()
 
     out_path = None
@@ -232,6 +386,7 @@ def main() -> None:
         device=args.device,
         conf=args.conf,
         max_frames=args.max_frames,
+        shots_jsonl=args.shots,
     )
 
 

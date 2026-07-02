@@ -60,12 +60,17 @@ def foot_point(xyxy):
     return [(x1 + x2) / 2.0, y2]
 
 
-def merge_perception(detections, shots, teams, ball_rows):
+def merge_perception(detections, shots, teams, ball_rows, frame_teams=None):
     """Merge the four contract streams into a list of per-frame perception dicts.
 
     Returns list sorted by frame_idx, and the raw list of processed frame_idxs
     used to drive the output (union of everything we have, detections preferred).
+
+    frame_teams: optional {frame_idx: {"<tid>": "home"|"away"}} per-frame team
+    labels (from teams_frames.jsonl); preferred over the per-track teams dict
+    because ByteTrack identity swaps make long tracks kit-impure.
     """
+    frame_teams = frame_teams or {}
     shot_by_frame = {r["frame_idx"]: r.get("shot", "main") for r in shots}
     ball_by_frame = {r["frame_idx"]: r for r in ball_rows}
 
@@ -89,7 +94,9 @@ def merge_perception(detections, shots, teams, ball_rows):
                     if b.get("cls") == "ball":
                         continue
                     tid = b.get("tid")
-                    team = teams.get(str(tid)) if tid is not None else None
+                    team = None
+                    if tid is not None:
+                        team = frame_teams.get(fidx, {}).get(str(tid)) or teams.get(str(tid))
                     players.append({
                         "tid": tid,
                         "team": team,
@@ -249,8 +256,10 @@ def run(video_path, out_dir):
     shots = load_jsonl(os.path.join(out_dir, "shots.jsonl"))
     teams = load_json(os.path.join(out_dir, "teams.json"))
     ball_rows = load_jsonl(os.path.join(out_dir, "ball.jsonl"))
+    frame_teams = {r["frame_idx"]: r.get("teams", {})
+                   for r in load_jsonl(os.path.join(out_dir, "teams_frames.jsonl"))}
 
-    merged = merge_perception(detections, shots, teams, ball_rows)
+    merged = merge_perception(detections, shots, teams, ball_rows, frame_teams=frame_teams)
 
     perception_path = os.path.join(out_dir, "perception.jsonl")
     write_perception_jsonl(merged, perception_path)

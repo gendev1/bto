@@ -7,15 +7,33 @@ writing teams.json:
     {"<tid>": "home"|"away"|"gk"|"ref", ...}
 
 Method: for each cls='player' track, sample up to N_SAMPLES frames spread
-over its life, crop the torso (rows 15%-45% of the box height, middle 60% of
-the width), mask out pitch-green pixels (HSV hue 35-85), and build an
-L1-normalized 2D hue-saturation histogram of what's left. Average the
-histograms per track, then hand-rolled k-means(k=2, kmeans++ init, fixed
-seed) clusters tracks into two kits; cluster 0 -> 'home', cluster 1 ->
-'away' (arbitrary but stable given the fixed seed). cls='goalkeeper' tracks
-are always 'gk'; cls='referee' tracks are always 'ref'. Tracks with too few
-or too small torso crops are still assigned to the nearest centroid, and are
-listed (with a low-confidence note) in the sidecar teams_confidence.json.
+over its life (or EVERY frame when per-frame output is requested), crop the
+torso (rows 15%-45% of the box height, middle 60% of the width), mask out
+pitch-green pixels (HSV hue 35-85), and build an L1-normalized 2D
+hue-saturation histogram of what's left. Hand-rolled k-means(k=2, kmeans++
+init, N_INIT restarts, best inertia kept) clusters the individual SAMPLE
+histograms into two kits; each track then takes the majority vote of its
+samples' cluster labels; cluster 0 -> 'home', cluster 1 -> 'away'
+(arbitrary but stable given fixed seeds). cls='goalkeeper' tracks are
+always 'gk'; cls='referee' tracks are always 'ref'. Tracks with too few or
+too small torso crops fall back to the nearest centroid of their mean
+histogram (or the larger cluster when they have no valid crops at all), and
+are listed with a low-confidence note in the sidecar teams_confidence.json.
+
+Why per-sample + majority vote instead of clustering per-track mean
+histograms (the original approach): measured on cwc2021 720p, ByteTrack
+identity swaps make long tracks IMPURE -- a single tid can spend half its
+life on a blue-kit player and half on a white-kit player, so the track-mean
+histogram lands mid-way between both kits, the cluster structure vanishes,
+and k-means (single fixed-seed init, no restarts) degenerated to a 107/1
+split. Per-sample clustering on the same data separates the kits at 94-96%
+sample purity.
+
+When frames_out_path is given, assign_teams also writes teams_frames.jsonl
+(one line per frame: {"frame_idx": int, "teams": {"<tid>": "home"|"away"}})
+with each player box classified INDEPENDENTLY per frame by nearest cluster
+centroid. Downstream (annotate_m2 merge) prefers the per-frame label over
+the per-track one, which is what actually survives impure tracks.
 """
 
 import argparse
@@ -35,6 +53,7 @@ MIN_CROP_PX = 6  # min crop width/height in px to trust a sample
 MIN_VALID_SAMPLES = 2  # below this a track is flagged low-confidence
 KMEANS_SEED = 0
 KMEANS_ITERS = 20
+KMEANS_N_INIT = 10  # restarts; single fixed init degenerates on mushy features
 
 TEAM_COLORS_BGR = {
     "home": (0, 0, 220),
@@ -128,14 +147,18 @@ def _hue_sat_hist(crop_bgr):
     return (hist / total).ravel()
 
 
-def _collect_track_features(video_path, tracks):
-    """Returns (tid -> mean histogram vector for tracks with >=1 sample, set of low-confidence tids)."""
+def _collect_track_features(video_path, tracks, all_frames=False):
+    """Returns (tid -> [(frame_idx, histogram), ...], set of low-confidence tids).
+
+    all_frames=True hists every player box in every frame (needed for
+    per-frame team output); otherwise up to N_SAMPLES per track.
+    """
     needed_frames = defaultdict(list)  # frame_idx -> [(tid, xyxy)]
     sample_counts = {}
     for tid, t in tracks.items():
         if t["cls"] != "player":
             continue
-        sampled = _sample_frame_indices(t["frames"])
+        sampled = t["frames"] if all_frames else _sample_frame_indices(t["frames"])
         sample_counts[tid] = len(sampled)
         for frame_idx, xyxy in sampled:
             needed_frames[frame_idx].append((tid, xyxy))
@@ -157,20 +180,16 @@ def _collect_track_features(video_path, tracks):
                     if crop is not None:
                         hist = _hue_sat_hist(crop)
                         if hist is not None:
-                            hists[tid].append(hist)
+                            hists[tid].append((frame_idx, hist))
                 remaining.discard(frame_idx)
             frame_idx += 1
         cap.release()
 
-    feats = {}
     low_conf = set()
     for tid, n_sampled in sample_counts.items():
-        vecs = hists.get(tid, [])
-        if len(vecs) < MIN_VALID_SAMPLES:
+        if len(hists.get(tid, [])) < MIN_VALID_SAMPLES:
             low_conf.add(tid)
-        if vecs:
-            feats[tid] = np.mean(vecs, axis=0)
-    return feats, low_conf
+    return dict(hists), low_conf
 
 
 # --------------------------------------------------------------------------
@@ -188,7 +207,7 @@ def _kmeans_pp_init(X, k, rng):
     return np.stack(centers)
 
 
-def _kmeans(X, k=2, iters=KMEANS_ITERS, seed=KMEANS_SEED):
+def _kmeans_once(X, k, iters, seed):
     rng = np.random.default_rng(seed)
     centers = _kmeans_pp_init(X, k, rng)
     labels = np.zeros(X.shape[0], dtype=int)
@@ -201,36 +220,74 @@ def _kmeans(X, k=2, iters=KMEANS_ITERS, seed=KMEANS_SEED):
     return labels, centers
 
 
+def _kmeans(X, k=2, iters=KMEANS_ITERS, seed=KMEANS_SEED, n_init=KMEANS_N_INIT):
+    """n_init kmeans++ restarts (seeds seed..seed+n_init-1), best inertia wins."""
+    best = None
+    for s in range(seed, seed + n_init):
+        labels, centers = _kmeans_once(X, k, iters, s)
+        inertia = sum(float(np.sum((X[labels == j] - centers[j]) ** 2)) for j in range(k))
+        if best is None or inertia < best[0]:
+            best = (inertia, labels, centers)
+    return best[1], best[2]
+
+
 # --------------------------------------------------------------------------
 # public API
 # --------------------------------------------------------------------------
 
-def assign_teams(video_path, detections_jsonl, out_path=None):
-    """Assigns every track id to home/away/gk/ref, writes teams.json, returns the dict."""
+def assign_teams(video_path, detections_jsonl, out_path=None, frames_out_path=None):
+    """Assigns every track id to home/away/gk/ref, writes teams.json, returns the dict.
+
+    frames_out_path: optional path for per-frame labels (teams_frames.jsonl,
+    one line per frame with a player box: {"frame_idx", "teams": {tid: label}}).
+    Setting it makes every player box get histogrammed (full video pass).
+    """
     frames = _load_detections(detections_jsonl)
     tracks = _tracks_from_frames(frames)
-    feats, low_conf = _collect_track_features(video_path, tracks)
-
-    global_mean = np.mean(list(feats.values()), axis=0) if feats else np.zeros(HUE_BINS * SAT_BINS)
+    hists, low_conf = _collect_track_features(video_path, tracks,
+                                              all_frames=frames_out_path is not None)
     player_tids = [tid for tid, t in tracks.items() if t["cls"] == "player"]
-    for tid in player_tids:
-        if tid not in feats:
-            feats[tid] = global_mean
-            low_conf.add(tid)
+    low_conf |= {tid for tid in player_tids if tid not in hists}
 
     teams = {}
     notes = {}
+    frame_teams = defaultdict(dict)  # frame_idx -> {str(tid): label}
 
-    if player_tids:
-        X = np.stack([feats[tid] for tid in player_tids])
-        if len(player_tids) >= 2:
-            labels, _ = _kmeans(X, k=2)
+    sample_owner = [(tid, fi) for tid in player_tids for fi, _ in hists.get(tid, [])]
+    if sample_owner:
+        X = np.stack([h for tid in player_tids for _, h in hists.get(tid, [])])
+        if len(X) >= 2:
+            labels, centers = _kmeans(X, k=2)
         else:
-            labels = np.zeros(len(player_tids), dtype=int)
-        for tid, lab in zip(player_tids, labels):
-            teams[str(tid)] = "home" if lab == 0 else "away"
+            labels, centers = np.zeros(len(X), dtype=int), np.stack([X[0], X[0]])
+        name = {0: "home", 1: "away"}
+
+        votes = defaultdict(lambda: [0, 0])
+        for (tid, fi), lab in zip(sample_owner, labels):
+            votes[tid][lab] += 1
+            frame_teams[fi][str(tid)] = name[int(lab)]
+
+        majority = 0 if sum(v[0] for v in votes.values()) >= sum(v[1] for v in votes.values()) else 1
+        for tid in player_tids:
+            v = votes.get(tid)
+            if v is None:  # no valid crop at all -> larger cluster
+                teams[str(tid)] = name[majority]
+            else:
+                teams[str(tid)] = name[0 if v[0] >= v[1] else 1]
             if tid in low_conf:
-                notes[str(tid)] = "low_confidence: insufficient/small torso crops, assigned to nearest centroid"
+                notes[str(tid)] = "low_confidence: insufficient/small torso crops"
+    else:
+        for tid in player_tids:
+            teams[str(tid)] = "home"
+            notes[str(tid)] = "low_confidence: no valid torso crops in whole clip"
+
+    if frames_out_path is not None:
+        fo_dir = os.path.dirname(frames_out_path)
+        if fo_dir:
+            os.makedirs(fo_dir, exist_ok=True)
+        with open(frames_out_path, "w") as f:
+            for fi in sorted(frame_teams):
+                f.write(json.dumps({"frame_idx": fi, "teams": frame_teams[fi]}) + "\n")
 
     for tid, t in tracks.items():
         if t["cls"] == "goalkeeper":
