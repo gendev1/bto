@@ -1,5 +1,14 @@
 # CUDA deployment plan (Triton / TensorRT)
 
+> **Decided target (2026-07-02): RTX 3060 12GB PC, WSL2, Chrome on the same PC.**
+> One-shot setup: clone the repo in WSL2 and run `bash scripts/setup_cuda_wsl2.sh` —
+> it checks the GPU, installs the env + TensorRT, downloads weights, builds FP16 engines
+> (detect at full 1280 — the 12GB budget removes the M1's 960 compromise), smoke-tests the
+> live pipeline on CUDA, and prints the max-profile server command
+> (`--device cuda --imgsz 1280 --calib-every 2 --player-model *.engine --pitch-model *.engine`).
+> WSL2's localhost forwarding lets Windows Chrome reach ws://127.0.0.1:8517 directly;
+> fallback is `networkingMode=mirrored` in `.wslconfig`.
+
 Status: **design doc, untested** — the dev machine is an M1 Mac (MPS, ~2.6 proc fps live).
 This documents how to hit SPEC §7 (≥15 FPS end-to-end on an RTX-3060-class GPU) when the host
 runs on NVIDIA hardware. Nothing here changes the extension, the WS protocol, or the pattern

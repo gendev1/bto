@@ -119,9 +119,12 @@ def _stub_detections_to_prims(bundle: Any) -> list[dict]:
     return []
 
 
-def _build_pipeline(imgsz: int, device: str):
+def _build_pipeline(imgsz: int, device: str, **pipeline_kw):
     if STREAM_MODULES_AVAILABLE:
-        return _RealStreamPipeline(imgsz=imgsz, device=device), _real_detections_to_prims
+        return (
+            _RealStreamPipeline(imgsz=imgsz, device=device, **pipeline_kw),
+            _real_detections_to_prims,
+        )
     log.warning(
         "bto.host.stream / bto.host.primitives not importable yet; "
         "running with a stub pipeline (no real detections)."
@@ -191,9 +194,10 @@ class HostState:
     so concurrent streams are rejected rather than queued/shared.
     """
 
-    def __init__(self, imgsz: int, device: str) -> None:
+    def __init__(self, imgsz: int, device: str, pipeline_kw: dict | None = None) -> None:
         self.imgsz = imgsz
         self.device = device
+        self.pipeline_kw = pipeline_kw or {}
         self.pipeline = None
         self._detections_to_prims = None
         self._stream_lock = asyncio.Lock()
@@ -201,7 +205,9 @@ class HostState:
 
     def ensure_pipeline(self):
         if self.pipeline is None:
-            self.pipeline, self._detections_to_prims = _build_pipeline(self.imgsz, self.device)
+            self.pipeline, self._detections_to_prims = _build_pipeline(
+                self.imgsz, self.device, **self.pipeline_kw
+            )
         return self.pipeline, self._detections_to_prims
 
     @property
@@ -209,8 +215,8 @@ class HostState:
         return self.pipeline is not None
 
 
-def create_app(imgsz: int = 960, device: str = "auto") -> FastAPI:
-    state = HostState(imgsz=imgsz, device=device)
+def create_app(imgsz: int = 960, device: str = "auto", pipeline_kw: dict | None = None) -> FastAPI:
+    state = HostState(imgsz=imgsz, device=device, pipeline_kw=pipeline_kw)
     app = FastAPI()
     app.state.bto_host = state
 
@@ -333,11 +339,25 @@ def main() -> None:
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--player-model", type=str, default=None,
+                        help=".pt or TensorRT .engine path (CUDA deploy)")
+    parser.add_argument("--pitch-model", type=str, default=None)
+    parser.add_argument("--calib-every", type=int, default=None,
+                        help="fit homography every Nth main frame (2 on CUDA)")
     args = parser.parse_args()
 
     import uvicorn
 
-    app = create_app(imgsz=args.imgsz, device=args.device)
+    pipeline_kw = {
+        k: v
+        for k, v in {
+            "player_model": args.player_model,
+            "pitch_model": args.pitch_model,
+            "calib_every": args.calib_every,
+        }.items()
+        if v is not None
+    }
+    app = create_app(imgsz=args.imgsz, device=args.device, pipeline_kw=pipeline_kw)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
