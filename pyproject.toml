@@ -7,6 +7,9 @@ dependencies = [
     "numpy>=1.26",
     "pandas>=2.2",
     "matplotlib>=3.9",
+    "ultralytics>=8.4.84",
+    "supervision>=0.29.1",
+    "opencv-python>=5.0.0.93",
 ]
 
 [dependency-groups]
